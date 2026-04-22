@@ -1,0 +1,30 @@
+{
+    "manifest_version": 3,
+    "name": "Route Assignment Extractor",
+    "version": "1.0",
+    "permissions": [
+        "tabs",
+        "scripting"
+    ],
+    "host_permissions": [
+        "https://logistics.amazon.com/*",
+        "https://recon.amngtpro.com//*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "action": {
+        "default_title": "Run Extraction"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "content.js"
+            ]
+        }
+    ]
+}
+
