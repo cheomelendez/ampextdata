@@ -1,276 +1,227 @@
-// ===== helpers =====
+console.log("BACKGROUND>JS started");
+
+import { FLOW_REGISTRY } from "./flows/index.js";
+
+const DEFAULT_FLOW_TYPE = "extract-route-assignments-data";
+
 function sleep(ms) {
-    return new Promise(res => setTimeout(res, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function waitForTabComplete(tabId) {
-    return new Promise(resolve => {
-        function listener(updatedTabId, info) {
-            if (updatedTabId === tabId && info.status === "complete") {
-                chrome.tabs.onUpdated.removeListener(listener);
-                resolve();
-            }
-        }
-        chrome.tabs.onUpdated.addListener(listener);
+  return new Promise((resolve) => {
+    function listener(updatedTabId, info) {
+      if (updatedTabId === tabId && info.status === "complete") {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+async function ensureExpectedTabUrl(flow, context, tabId, expectedUrl, date) {
+  if (typeof flow.matchesExpectedUrl !== "function") {
+    return;
+  }
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const currentTab = await chrome.tabs.get(tabId);
+    const currentUrl = currentTab.url || "";
+
+    console.log(
+      `[${context.flowType}] URL validation attempt ${attempt}:`,
+      currentUrl,
+    );
+
+    if (flow.matchesExpectedUrl({ currentUrl, expectedUrl, date })) {
+      return;
+    }
+
+    console.warn(
+      `[${context.flowType}] Unexpected URL detected. Re-navigating to expected URL for date ${date}`,
+    );
+
+    await chrome.tabs.update(tabId, { url: expectedUrl });
+    await waitForTabComplete(tabId);
+    await sleep(2000);
+  }
+}
+
+function buildFlowContext(payload) {
+  const flowType = payload.flowType || DEFAULT_FLOW_TYPE;
+  const flow = FLOW_REGISTRY[flowType];
+
+  if (!flow) {
+    throw new Error(`Unsupported flow type: ${flowType}`);
+  }
+
+  const context = {
+    ...payload,
+    flowType,
+  };
+
+  if (!context.baseUrl) {
+    context.baseUrl = flow.defaultBaseUrl;
+  }
+
+  if (
+    !context.baseUrl ||
+    !context.dates?.length ||
+    !context.serviceAreaId ||
+    !context.token
+  ) {
+    throw new Error("Missing required payload fields");
+  }
+
+  return { flow, context };
+}
+
+async function executeFlowForDate(flow, context, date) {
+  const url = flow.buildUrl({
+    baseUrl: context.baseUrl,
+    date,
+    serviceAreaId: context.serviceAreaId,
+  });
+
+  console.log(`[${context.flowType}] Processing date: ${date}`);
+  console.log(`[${context.flowType}] Requested URL: ${url}`);
+
+  const tab = await chrome.tabs.create({
+    url,
+    active: Boolean(context.debugActiveTab),
+  });
+
+  console.log(
+    `[${context.flowType}] Created tab ${tab.id} with initial URL:`,
+    tab.url,
+  );
+
+  try {
+    await waitForTabComplete(tab.id);
+    console.log(`[${context.flowType}] Tab loaded`);
+
+    const loadedTab = await chrome.tabs.get(tab.id);
+    console.log(`[${context.flowType}] Tab URL after load:`, loadedTab.url);
+
+    await ensureExpectedTabUrl(flow, context, tab.id, url, date);
+
+    await sleep(flow.postLoadDelayMs ?? 4000);
+
+    const delayedTab = await chrome.tabs.get(tab.id);
+    console.log(
+      `[${context.flowType}] Tab URL before executeScript after delay:`,
+      delayedTab.url,
+    );
+
+    await ensureExpectedTabUrl(flow, context, tab.id, url, date);
+
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: flow.extractInPage,
+      args: [
+        {
+          date,
+          flowType: context.flowType,
+          serviceAreaId: context.serviceAreaId,
+          token: context.token,
+        },
+      ],
     });
+
+    const extractedData = result?.result;
+    console.log(`[${context.flowType}] executeScript result wrapper:`, result);
+    console.log(`[${context.flowType}] Extracted data:`, extractedData);
+
+    await submitFlowResult(flow, context, {
+      date,
+      extractedData,
+      url,
+    });
+  } finally {
+    const keepTabOpenMs = Number(context.keepTabOpenMs || 0);
+
+    if (keepTabOpenMs > 0) {
+      console.log(
+        `[${context.flowType}] Keeping tab ${tab.id} open for ${keepTabOpenMs}ms for debugging`,
+      );
+      await sleep(keepTabOpenMs);
+    }
+
+    if (context.closeTab === false) {
+      console.log(
+        `[${context.flowType}] Leaving tab ${tab.id} open for debugging`,
+      );
+      return;
+    }
+
+    await chrome.tabs.remove(tab.id);
+  }
 }
 
-// ===== main flow =====
+async function submitFlowResult(flow, context, runResult) {
+  const submission = flow.buildSubmission({
+    context,
+    date: runResult.date,
+    extractedData: runResult.extractedData,
+    url: runResult.url,
+  });
+
+  console.log(`[${context.flowType}] Submitting payload:`, submission.body);
+
+  const response = await fetch(submission.url, {
+    method: submission.method || "POST",
+    headers: submission.headers,
+    body: JSON.stringify(submission.body),
+  });
+
+  const responseBody = await response.text();
+  console.log(`[${context.flowType}] Submission status:`, response.status);
+  console.log(`[${context.flowType}] Submission body:`, responseBody);
+}
+
 async function runExtraction(payload) {
-    try {
-        const { baseUrl, dates, token, serviceAreaId } = payload;
+  try {
+    const { flow, context } = buildFlowContext(payload);
+    console.log(
+      `[${context.flowType}] Starting batch extraction:`,
+      context.dates,
+    );
 
-        if (!baseUrl || !dates?.length || !serviceAreaId || !token) {
-            console.error("❌ Missing required payload fields");
-            return;
-        }
-
-        console.log("🟡 Starting batch extraction:", dates);
-
-        for (const date of dates) {
-
-            let url = baseUrl
-                .replace("{date}", date)
-                .replace("{serviceAreaId}", serviceAreaId);
-
-            console.log(`📅 Processing date: ${date}`);
-            console.log(`🔗 URL: ${url}`);
-
-            const tab = await chrome.tabs.create({
-                url,
-                active: false
-            });
-
-            await waitForTabComplete(tab.id);
-            console.log("🟢 Tab loaded");
-
-            await sleep(4000);
-
-            console.log("🚀 Running extraction (with context)");
-
-            // ✅ SINGLE EXECUTION WITH CONTEXT
-            await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                func: async (context) => {
-
-                    console.log("📦 Context received:", context);
-
-                    function parseRow(row) {
-
-                        // 🔥 FIX #1: explicitly find the correct ancestor ".row"
-                        const rowContainer = row.closest(".row");
-
-                        // 🔥 FIX #2: skip ONLY if THAT row is hidden
-                        if (
-                            !rowContainer ||
-                            rowContainer.style.display === "none" ||
-                            getComputedStyle(rowContainer).display === "none"
-                        ) {
-                            return null;
-                        }
-
-                        const headerEl = row.querySelector(".rowHeader");
-
-                        const headerText =
-                            headerEl?.querySelector("span")?.innerText?.trim() || "";
-
-                        const fullRowText = row.innerText || "";
-
-                        const dataFields = row.querySelectorAll(".rowHeaderData");
-
-                        let confirmed = Number(
-                            dataFields[0]?.querySelector("span")?.innerText || 0
-                        );
-
-                        let rostered = Number(
-                            dataFields[1]?.querySelector("span")?.innerText || 0
-                        );
-
-                        // 🔥 EDGE CASE (Misc)
-                        const isMiscRow = /miscellaneous route assignments/i.test(fullRowText);
-                        const hasStation = /station/i.test(fullRowText);
-                        const hasDuration = /\d+\s*hours?/i.test(fullRowText);
-
-                        if (isMiscRow && !hasStation && !hasDuration) {
-                            const submitMatch = fullRowText.match(/(\d+)\s*submit/i);
-                            const submit = submitMatch ? Number(submitMatch[1]) : 0;
-
-                            return {
-                                service: "Miscellaneous Route Assignments",
-                                type: null,
-                                station: null,
-                                duration: null,
-                                submit,
-                                confirmed: 0,
-                                rostered: 0
-                            };
-                        }
-
-                        // 🔹 Duration
-                        const durationMatch = headerText.match(/(\d+\s*Hours?)/i);
-                        const duration = durationMatch ? durationMatch[1] : null;
-
-                        // 🔹 Station
-                        let station = null;
-                        const stationMatch = headerText.match(/-\s*([^-\n]*station[^-\n]*)/i);
-                        if (stationMatch) {
-                            station = stationMatch[1].trim();
-                        }
-
-                        // 🔹 Clean text
-                        let cleaned = headerText;
-
-                        if (duration) cleaned = cleaned.replace(duration, "");
-                        if (station) cleaned = cleaned.replace(`- ${station}`, "");
-
-                        cleaned = cleaned.replace(/\d+\s*Confirmed/i, "");
-                        cleaned = cleaned.replace(/\d+\s*Rostered/i, "");
-
-                        cleaned = cleaned
-                            .replace(/\s*-\s*/g, " - ")
-                            .replace(/-\s*$/, "")
-                            .replace(/^\s*-\s*/, "")
-                            .trim();
-
-                        const parts = cleaned
-                            .split(" - ")
-                            .map(p => p.trim().replace(/-$/, "").trim())
-                            .filter(Boolean);
-
-                        function isVehicleSegment(segment) {
-                            return /(Van|Step Van|Vehicle)/i.test(segment);
-                        }
-
-                        let serviceParts = [];
-                        let remainingParts = [];
-
-                        parts.forEach((segment, index) => {
-                            if (index === 0 || isVehicleSegment(segment)) {
-                                serviceParts.push(segment);
-                            } else {
-                                remainingParts.push(segment);
-                            }
-                        });
-
-                        const service = serviceParts.length
-                            ? serviceParts.join(" - ")
-                            : null;
-
-                        const type = remainingParts.length
-                            ? remainingParts.join(" - ")
-                            : null;
-
-                        return {
-                            service,
-                            type,
-                            station,
-                            duration,
-                            confirmed,
-                            rostered
-                        };
-                    }
-
-                    function extract() {
-                        const container = document.querySelector("#confirmedServiceRequestSection");
-                        if (!container) {
-                            console.warn("❌ Container not found");
-                            return [];
-                        }
-
-                        const rows = container.querySelectorAll(".rowHeaderContainer");
-                        console.log("✅ Rows detected:", rows.length);
-
-                        //return Array.from(rows).map(parseRow);
-                        // 🔥 FIX: map + filter(Boolean)
-                        const results = Array.from(rows)
-                            .map(parseRow)
-                            .filter(Boolean);
-
-                        console.log("🚀 Extracted Data:", results);
-                        console.log("📊 Total valid rows:", results.length);
-                        return results;
-                    }
-
-                    function waitForUI() {
-                        return new Promise(resolve => {
-                            if (document.querySelectorAll(".rowHeaderContainer").length > 0) {
-                                return resolve();
-                            }
-
-                            const obs = new MutationObserver(() => {
-                                if (document.querySelectorAll(".rowHeaderContainer").length > 0) {
-                                    obs.disconnect();
-                                    resolve();
-                                }
-                            });
-
-                            obs.observe(document.body, { childList: true, subtree: true });
-
-                            setTimeout(() => {
-                                obs.disconnect();
-                                resolve();
-                            }, 10000);
-                        });
-                    }
-
-                    await waitForUI();
-
-                    const data = extract();
-
-                    console.log("🚀 Extracted Data:", data);
-                    console.log("🔐 Token:", context.token);
-                    console.log("📅 Date:", context.date);
-                    console.log("🧭 ServiceAreaId:", context.serviceAreaId);
-
-                    try {
-                        const response = await fetch("https://recon.amngtpro.com/api/functions/receiveRouteData", {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                "Authorization": `Bearer ${context.token}`
-                            },
-                            body: JSON.stringify({
-                                date: context.date,
-                                serviceAreaId: context.serviceAreaId,
-                                services: data
-                            })
-                        });
-
-                        console.log("📡 Status:", response.status);
-                        console.log("📡 Body:", await response.text());
-
-                    } catch (err) {
-                        console.error("❌ Fetch error:", err);
-                    }
-                },
-                args: [{ token, date, serviceAreaId }]
-            });
-
-            await sleep(5000);
-
-            await chrome.tabs.remove(tab.id);
-        }
-
-        console.log("✅ Batch extraction completed");
-
-    } catch (err) {
-        console.error("❌ runExtraction failed:", err);
+    for (const date of context.dates) {
+      await executeFlowForDate(flow, context, date);
+      await sleep(flow.betweenDatesDelayMs ?? 1000);
     }
+
+    console.log(`[${context.flowType}] Batch extraction completed`);
+  } catch (error) {
+    console.error("runExtraction failed:", error);
+  }
 }
 
-// ===== listeners =====
-chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === "START_FLOW") {
-        runExtraction(msg.payload);
-    }
+chrome.runtime.onMessage.addListener((message) => {
+  if (
+    message.type === "START_AMAZON_EXTRACTION" ||
+    message.type === "START_FLOW"
+  ) {
+    runExtraction(message.payload);
+  }
 });
 
-// optional manual test
 chrome.action.onClicked.addListener(() => {
-    runExtraction({
-        serviceAreaId: "221c60b4-2825-4fdf-80de-360cdc73e8f4",
-        baseUrl: "https://logistics.amazon.com/scheduling?serviceAreaId={serviceAreaId}&date={date}",
-        dates: ["2026-03-08"],
-        token: "test-token"
-    });
+  runExtraction({
+    //flowType: "extract-work-summary-tool-data",
+    //flowType: "extract-route-assignments-data",
+    flowType: "extract-weekly-schedule",
+    serviceAreaId: "221c60b4-2825-4fdf-80de-360cdc73e8f4",
+    baseUrl:
+      //"https://logistics.amazon.com/harmony/v2/#!/dsp-portal?serviceAreaId={serviceAreaId}&localDate={date}",
+      //"https://logistics.amazon.com/scheduling?serviceAreaId={serviceAreaId}&date={date}",
+      "https://logistics.amazon.com/scheduling/calendar-view/week?date={date}&serviceAreaId={serviceAreaId}",
+    dates: ["2026-04-16"],
+    token: "test-token",
+    debugActiveTab: true,
+    keepTabOpenMs: 60000,
+  });
 });
