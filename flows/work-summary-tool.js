@@ -49,6 +49,10 @@ async function extractWorkSummaryToolInPage(context) {
     });
   }
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   function parseNumber(value) {
     const normalizedValue = (value || "").replace(/,/g, "").trim();
     const parsed = Number(normalizedValue);
@@ -97,6 +101,113 @@ async function extractWorkSummaryToolInPage(context) {
     });
 
     return valuesByLabel;
+  }
+
+  function formatHourDuration(hours) {
+    const normalizedHours = Number(hours);
+    const displayHours = Number.isInteger(normalizedHours)
+      ? String(normalizedHours)
+      : String(normalizedHours).replace(/\.0$/, "");
+
+    return `${displayHours} ${normalizedHours === 1 ? "Hour" : "Hours"}`;
+  }
+
+  function buildEmptyRoute(service) {
+    return {
+      service,
+      type: null,
+      duration: null,
+      deliveredPackages: null,
+      pickupPackages: null,
+      dspLateCancel: null,
+      amzLateCancel: null,
+      completedRoutes: null,
+    };
+  }
+
+  function getTrainingEventRows(holder) {
+    return Array.from(holder.querySelectorAll(".fwt-listBoxItem")).filter(
+      (row) =>
+        isVisible(row) && /total duration\s*:/i.test(row.textContent || ""),
+    );
+  }
+
+  function parseTrainingDurationHours(row) {
+    const durationText =
+      Array.from(row.querySelectorAll(".ng-binding"))
+        .map((node) => node.textContent || "")
+        .find((text) => /total duration\s*:/i.test(text)) ||
+      row.textContent ||
+      "";
+    const durationMatch = durationText.match(
+      /total duration\s*:\s*([\d.]+)\s*(?:hr|hour)s?\b/i,
+    );
+
+    if (!durationMatch) {
+      return null;
+    }
+
+    const hours = Number(durationMatch[1]);
+    return Number.isFinite(hours) ? hours : null;
+  }
+
+  async function expandTrainingHolder(holder) {
+    if (getTrainingEventRows(holder).length > 0) {
+      return;
+    }
+
+    const expandTarget =
+      holder.querySelector(".fwt-listBoxHeading .fwt-expand-collapse") ||
+      holder.querySelector(".fwt-listBoxHeading [ng-click*='expanded']") ||
+      holder.querySelector(".fwt-listBoxHeading");
+
+    if (!expandTarget) {
+      console.warn("[work-summary-page] Training expand target not found");
+      return;
+    }
+
+    expandTarget.click();
+
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(250);
+
+      if (getTrainingEventRows(holder).length > 0) {
+        return;
+      }
+    }
+  }
+
+  async function extractTrainingRoutes(holder) {
+    await expandTrainingHolder(holder);
+
+    const countsByHours = new Map();
+    getTrainingEventRows(holder).forEach((row) => {
+      const hours = parseTrainingDurationHours(row);
+
+      if (hours === null) {
+        return;
+      }
+
+      countsByHours.set(hours, (countsByHours.get(hours) || 0) + 1);
+    });
+
+    if (countsByHours.size === 0) {
+      console.warn("[work-summary-page] Training rows found without durations");
+      return [buildEmptyRoute("Training")];
+    }
+
+    return Array.from(countsByHours.entries())
+      .sort(([leftHours], [rightHours]) => rightHours - leftHours)
+      .map(([hours, completedRoutes]) => ({
+        service: "Training",
+        type: null,
+        duration: formatHourDuration(hours),
+        deliveredPackages: null,
+        pickupPackages: null,
+        dspLateCancel: null,
+        amzLateCancel: null,
+        completedRoutes,
+      }));
   }
 
   function parseRouteHeading(headingText) {
@@ -196,7 +307,7 @@ async function extractWorkSummaryToolInPage(context) {
     return header;
   }
 
-  function extractRoutes() {
+  async function extractRoutes() {
     const routeListContainer = document.querySelector(
       `div[ng-include="'routeList.html'"]`,
     );
@@ -210,46 +321,41 @@ async function extractWorkSummaryToolInPage(context) {
       routeListContainer.querySelectorAll(".fwt-listBox.workSheetHolder"),
     ).filter(isVisible);
 
-    const routes = routeHolders
-      .map((holder) => {
-        const headingText =
-          holder.querySelector(".fwt-listBoxHeading h4")?.textContent || "";
-        const parsedHeading = parseRouteHeading(headingText);
+    const routes = [];
 
-        if (
-          /^(training|excluded services)$/i.test(parsedHeading.service || "")
-        ) {
-          return {
-            service: parsedHeading.service,
-            type: null,
-            duration: null,
-            deliveredPackages: null,
-            pickupPackages: null,
-            dspLateCancel: null,
-            amzLateCancel: null,
-            completedRoutes: null,
-          };
-        }
+    for (const holder of routeHolders) {
+      const headingText =
+        holder.querySelector(".fwt-listBoxHeading h4")?.textContent || "";
+      const parsedHeading = parseRouteHeading(headingText);
 
-        const dataRow = holder.querySelector(".fwt-data-row");
-        if (!dataRow) {
-          return null;
-        }
+      if (/^training$/i.test(parsedHeading.service || "")) {
+        routes.push(...(await extractTrainingRoutes(holder)));
+        continue;
+      }
 
-        const valuesByLabel = extractQuantityValues(dataRow);
+      if (/^excluded services$/i.test(parsedHeading.service || "")) {
+        routes.push(buildEmptyRoute(parsedHeading.service));
+        continue;
+      }
 
-        return {
-          service: parsedHeading.service,
-          type: parsedHeading.type,
-          duration: parsedHeading.duration,
-          deliveredPackages: valuesByLabel["delivered packages"] ?? 0,
-          pickupPackages: valuesByLabel["pickup packages"] ?? 0,
-          dspLateCancel: valuesByLabel["dsp late cancel"] ?? 0,
-          amzLateCancel: valuesByLabel["amzl late cancel"] ?? 0,
-          completedRoutes: valuesByLabel["completed routes"] ?? 0,
-        };
-      })
-      .filter(Boolean);
+      const dataRow = holder.querySelector(".fwt-data-row");
+      if (!dataRow) {
+        continue;
+      }
+
+      const valuesByLabel = extractQuantityValues(dataRow);
+
+      routes.push({
+        service: parsedHeading.service,
+        type: parsedHeading.type,
+        duration: parsedHeading.duration,
+        deliveredPackages: valuesByLabel["delivered packages"] ?? 0,
+        pickupPackages: valuesByLabel["pickup packages"] ?? 0,
+        dspLateCancel: valuesByLabel["dsp late cancel"] ?? 0,
+        amzLateCancel: valuesByLabel["amzl late cancel"] ?? 0,
+        completedRoutes: valuesByLabel["completed routes"] ?? 0,
+      });
+    }
 
     console.log("[work-summary-page] Extracted routes:", routes);
     return routes;
@@ -262,7 +368,7 @@ async function extractWorkSummaryToolInPage(context) {
 
   return {
     header: extractHeader(),
-    routes: extractRoutes(),
+    routes: await extractRoutes(),
   };
 }
 

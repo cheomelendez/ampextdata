@@ -211,15 +211,15 @@ chrome.runtime.onMessage.addListener((message) => {
 
 chrome.action.onClicked.addListener(() => {
   runExtraction({
-    //flowType: "extract-work-summary-tool-data",
+    flowType: "extract-work-summary-tool-data",
     //flowType: "extract-route-assignments-data",
-    flowType: "extract-weekly-schedule",
+    //flowType: "extract-weekly-schedule",
     serviceAreaId: "221c60b4-2825-4fdf-80de-360cdc73e8f4",
     baseUrl:
-      //"https://logistics.amazon.com/harmony/v2/#!/dsp-portal?serviceAreaId={serviceAreaId}&localDate={date}",
-      //"https://logistics.amazon.com/scheduling?serviceAreaId={serviceAreaId}&date={date}",
-      "https://logistics.amazon.com/scheduling/calendar-view/week?date={date}&serviceAreaId={serviceAreaId}",
-    dates: ["2026-04-16"],
+      "https://logistics.amazon.com/harmony/v2/#!/dsp-portal?serviceAreaId={serviceAreaId}&localDate={date}",
+    //"https://logistics.amazon.com/scheduling?serviceAreaId={serviceAreaId}&date={date}",
+    //"https://logistics.amazon.com/scheduling/calendar-view/week?date={date}&serviceAreaId={serviceAreaId}",
+    dates: ["2026-04-24"],
     token: "test-token",
     debugActiveTab: true,
     keepTabOpenMs: 60000,

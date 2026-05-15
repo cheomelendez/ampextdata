@@ -49,10 +49,6 @@ async function extractWeeklyScheduleInPage(context) {
     });
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
   function normalizeText(value) {
     return (value || "").replace(/\s+/g, " ").trim();
   }
@@ -74,29 +70,6 @@ async function extractWeeklyScheduleInPage(context) {
     return /\b\d{1,2}:\d{2}(am|pm)\s*-\s*\d{1,2}:\d{2}(am|pm)\b/i.test(
       normalizeText(value),
     );
-  }
-
-  function findWeekHeader() {
-    const weekLabel = Array.from(document.querySelectorAll("p")).find((node) =>
-      /^Week\s+\d+:?$/i.test(normalizeText(node.textContent)),
-    );
-
-    if (!weekLabel) {
-      return null;
-    }
-
-    const weekRange = weekLabel.parentElement
-      ? Array.from(weekLabel.parentElement.querySelectorAll("p")).find(
-          (node) =>
-            node !== weekLabel &&
-            /^[A-Z][a-z]{2}\s+\d{2}\s+-/i.test(normalizeText(node.textContent)),
-        )
-      : null;
-
-    return {
-      week: normalizeText(weekLabel.textContent),
-      range: normalizeText(weekRange?.textContent || ""),
-    };
   }
 
   function findVoluntarySectionRoot() {
@@ -214,68 +187,64 @@ async function extractWeeklyScheduleInPage(context) {
       timeRange: normalizeText(
         timeNode.getAttribute("title") || timeNode.textContent,
       ),
-      serviceHint: normalizeText(
-        Array.from(dayCell.querySelectorAll("p[title]"))
-          .find((node) => !isTimeRangeText(node.getAttribute("title")))
-          ?.getAttribute("title") || "",
-      ),
     };
   }
 
-  async function clickEntry(entry) {
-    entry.clickTarget.click?.();
+  function clickEntry(entry) {
+    entry.clickTarget.scrollIntoView?.({ block: "center", inline: "center" });
+    if (typeof PointerEvent === "function") {
+      entry.clickTarget.dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true, cancelable: true }),
+      );
+    }
     entry.clickTarget.dispatchEvent(
-      new MouseEvent("click", { bubbles: true, cancelable: true }),
+      new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
     );
-    await sleep(1000);
+    entry.clickTarget.dispatchEvent(
+      new MouseEvent("mouseup", { bubbles: true, cancelable: true }),
+    );
+    if (typeof PointerEvent === "function") {
+      entry.clickTarget.dispatchEvent(
+        new PointerEvent("pointerup", { bubbles: true, cancelable: true }),
+      );
+    }
+    entry.clickTarget.click?.();
   }
 
   function findPopupContainer() {
-    const allDialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+    const fallbackSelectors = [
+      '[role="dialog"]',
+      '[class*="popover"]',
+      '[class*="Popper"]',
+      '[class*="tooltip"]',
+      '[class*="modal"]',
+      '[class*="dialog"]',
+      "[role='presentation']",
+    ].join(",");
+    const fallbackRoots = Array.from(
+      document.querySelectorAll(fallbackSelectors),
+    );
+    const fallbackSearchRoots = fallbackRoots.length
+      ? fallbackRoots
+      : [document.body];
+    const seen = new Set();
+    const fallbackCandidates = [];
 
-    const dialogCandidates = allDialogs.filter((node) => {
-      if (!isVisible(node)) return false;
-      const text = normalizeText(node.innerText || "").toLowerCase();
-      return (
-        text.includes("hours worked") &&
-        text.includes("based on flex:") &&
-        text.includes("work block") &&
-        text.includes("shift")
-      );
+    fallbackSearchRoots.forEach((root) => {
+      const nodes = root === document.body
+        ? Array.from(root.children)
+        : [root, ...Array.from(root.querySelectorAll("*"))];
+
+      nodes.forEach((node) => {
+        if (seen.has(node) || !isVisible(node)) return;
+        seen.add(node);
+
+        const text = normalizeText(node.textContent || "").toLowerCase();
+        if (text.includes("hours worked")) {
+          fallbackCandidates.push(node);
+        }
+      });
     });
-
-    if (dialogCandidates.length) {
-      return dialogCandidates.sort(
-        (left, right) =>
-          normalizeText(left.innerText || "").length -
-          normalizeText(right.innerText || "").length,
-      )[0];
-    }
-
-    const allBodyElements = Array.from(document.querySelectorAll("body *"));
-    console.log(
-      "[weekly-schedule-page] All body elements checked:",
-      allBodyElements.length,
-    );
-
-    const fallbackCandidates = allBodyElements.filter((node) => {
-      if (!isVisible(node)) return false;
-      const text = normalizeText(node.innerText || "").toLowerCase();
-      return (
-        text.includes("hours worked") &&
-        text.includes("based on flex:") &&
-        text.includes("work block") &&
-        text.includes("shift")
-      );
-    });
-
-    console.log(
-      "[weekly-schedule-page] Fallback candidates after filter:",
-      fallbackCandidates.length,
-    );
-    fallbackCandidates.forEach((c, i) =>
-      console.log(`Fallback ${i} text:`, normalizeText(c.innerText || "")),
-    );
 
     if (!fallbackCandidates.length) {
       return null;
@@ -283,73 +252,78 @@ async function extractWeeklyScheduleInPage(context) {
 
     return fallbackCandidates.sort(
       (left, right) =>
-        normalizeText(left.innerText || "").length -
-        normalizeText(right.innerText || "").length,
+        normalizeText(left.textContent || "").length -
+        normalizeText(right.textContent || "").length,
     )[0];
   }
 
-  async function waitForPopupContainer(timeoutMs = 10000) {
-    const start = Date.now();
+  async function waitForPopupContainer(timeoutMs = 4000) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let settleTimeoutId = null;
 
-    while (Date.now() - start < timeoutMs) {
+      function finish(popup) {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearTimeout(settleTimeoutId);
+        observer.disconnect();
+        resolve(popup);
+      }
+
+      function checkForPopup() {
+        const popup = findPopupContainer();
+        if (popup) {
+          finish(popup);
+        }
+      }
+
+      const observer = new MutationObserver(() => {
+        checkForPopup();
+      });
+
+      observer.observe(document.body, {
+        attributes: true,
+        childList: true,
+        subtree: true,
+      });
+
       const popup = findPopupContainer();
       if (popup) {
-        return popup;
+        finish(popup);
+        return;
       }
-      await sleep(200);
-    }
 
-    return null;
+      settleTimeoutId = setTimeout(() => finish(null), timeoutMs);
+    });
   }
 
-  function extractValueFromPopupText(popupText, label, nextLabel) {
-    const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const escapedNextLabel = nextLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const regex = new RegExp(
-      `${escapedLabel}\\s*(.*?)\\s*${escapedNextLabel}`,
-      "is",
-    );
-    const match = popupText.match(regex);
-    return normalizeText(match?.[1] || "");
-  }
-
-  function extractPopupData(popup) {
+  function extractHoursWorked(popup) {
     const paragraphs = Array.from(popup.querySelectorAll("p")).map((node) =>
       normalizeText(node.textContent || ""),
     );
-    const popupText = normalizeText(popup.innerText || "");
 
-    function valueAfter(label) {
-      const index = paragraphs.findIndex((text) => text === label);
-      if (index === -1) {
-        return "";
-      }
-      return paragraphs[index + 1] || "";
+    const labelIndex = paragraphs.findIndex((text) => text === "Hours Worked");
+    if (labelIndex !== -1) {
+      return paragraphs[labelIndex + 1] || "";
     }
 
-    function valueStartingWith(prefix) {
-      return (
-        paragraphs.find((text) =>
-          text.toLowerCase().startsWith(prefix.toLowerCase()),
-        ) || ""
-      );
-    }
-
-    const result = {
-      hoursWorked: valueAfter("Hours Worked"),
-      basedOnFlex: valueStartingWith("Based on Flex:").replace(
-        /^Based on Flex:\s*/i,
-        "",
-      ),
-      workBlock: valueAfter("Work Block"),
-      shift: valueAfter("Shift"),
-      popupText,
-    };
-
-    return result;
+    const popupText = normalizeText(popup.textContent || "");
+    const hoursMatch = popupText.match(/hours worked\s*([\d.]+\s*h(?:r)?)/i);
+    return normalizeText(hoursMatch?.[1] || "");
   }
 
-  async function closePopup() {
+  function findOpenPopupContainer() {
+    return findPopupContainer();
+  }
+
+  async function closePopup(popupToClose = findOpenPopupContainer()) {
+    if (!popupToClose) {
+      return;
+    }
+
     document.dispatchEvent(
       new KeyboardEvent("keydown", {
         key: "Escape",
@@ -364,7 +338,45 @@ async function extractWeeklyScheduleInPage(context) {
         cancelable: true,
       }),
     );
-    await sleep(300);
+
+    await new Promise((resolve) => {
+      let settled = false;
+      let settleTimeoutId = null;
+
+      function finish() {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearTimeout(settleTimeoutId);
+        observer.disconnect();
+        resolve();
+      }
+
+      function isPopupClosed() {
+        return !popupToClose.isConnected || !isVisible(popupToClose);
+      }
+
+      const observer = new MutationObserver(() => {
+        if (isPopupClosed()) {
+          finish();
+        }
+      });
+
+      observer.observe(document.body, {
+        attributes: true,
+        childList: true,
+        subtree: true,
+      });
+
+      if (isPopupClosed()) {
+        finish();
+        return;
+      }
+
+      settleTimeoutId = setTimeout(finish, 1500);
+    });
   }
 
   function extractDateHeaders() {
@@ -372,14 +384,11 @@ async function extractWeeklyScheduleInPage(context) {
       document.querySelectorAll('button span[aria-label="Day options"]'),
     );
 
-    const dates = headerButtons.map((button) => {
+    return headerButtons.map((button) => {
       const container = button.closest("div.css-1ksidz3");
       const dateLink = container?.querySelector("a.css-153px2c");
       return normalizeText(dateLink?.textContent || "");
     });
-
-    console.log("[weekly-schedule-page] Extracted date headers:", dates);
-    return dates;
   }
 
   function getColumnIndexFromCell(dayCell) {
@@ -393,9 +402,6 @@ async function extractWeeklyScheduleInPage(context) {
 
   await waitForPageStability();
   console.log("[weekly-schedule-page] Page stabilized, starting extraction");
-
-  const weekHeader = findWeekHeader();
-  console.log("[weekly-schedule-page] Week header:", weekHeader);
 
   const dateHeaders = extractDateHeaders();
 
@@ -416,6 +422,7 @@ async function extractWeeklyScheduleInPage(context) {
   );
 
   const collectedEntries = [];
+  let openPopup = findOpenPopupContainer();
 
   for (const rowRoot of employeeRows) {
     const employeeName = getEmployeeName(rowRoot);
@@ -435,11 +442,12 @@ async function extractWeeklyScheduleInPage(context) {
         continue;
       }
 
-      // Ensure no previous popup is lingering
-      await closePopup();
+      if (openPopup) {
+        await closePopup(openPopup);
+        openPopup = null;
+      }
 
-      await clickEntry(entry);
-      await sleep(600);
+      clickEntry(entry);
       const popup = await waitForPopupContainer();
 
       if (!popup) {
@@ -452,30 +460,35 @@ async function extractWeeklyScheduleInPage(context) {
         continue;
       }
 
-      const popupData = extractPopupData(popup);
-      const columnIndex = getColumnIndexFromCell(dayCell);
-      const date = dateHeaders[columnIndex] || "";
+      openPopup = popup;
 
+      const columnIndex = getColumnIndexFromCell(dayCell);
       const record = {
         employeeName,
         employeeIdentity,
-        date,
-        dayIndex,
+        date: dateHeaders[columnIndex] || "",
+        hoursWorked: extractHoursWorked(popup),
         timeRange: entry.timeRange,
-        serviceHint: entry.serviceHint || null,
-        ...popupData,
       };
 
       collectedEntries.push(record);
-      console.log("[weekly-schedule-page] Collected entry:", record);
 
-      await closePopup();
+      if (collectedEntries.length % 25 === 0) {
+        console.log(
+          "[weekly-schedule-page] Collected weekly schedule entries:",
+          collectedEntries.length,
+        );
+      }
     }
   }
 
+  if (openPopup) {
+    await closePopup(openPopup);
+  }
+
   console.log(
-    "[weekly-schedule-page] Final collected weekly schedule entries:",
-    collectedEntries,
+    "[weekly-schedule-page] Final collected weekly schedule entry count:",
+    collectedEntries.length,
   );
 
   // Group entries by employee
@@ -490,28 +503,26 @@ async function extractWeeklyScheduleInPage(context) {
         date: entry.date,
         hoursWorked: entry.hoursWorked,
         timeRange: entry.timeRange,
-        workBlock: entry.workBlock,
-        shift: entry.shift,
       }));
 
     return {
       employeeName,
       daysWorked: dayCells.length,
-      daysIncomplete: null,
       shifts,
     };
   });
 
   const responseData = {
-    week: weekHeader?.week || "",
-    week_date_range: weekHeader?.range || "",
     number_of_employees: employeeRows.length,
     employees,
   };
 
   console.log(
-    "[weekly-schedule-page] Final response data to be sent:",
-    responseData,
+    "[weekly-schedule-page] Final response summary:",
+    {
+      number_of_employees: responseData.number_of_employees,
+      number_of_shifts: collectedEntries.length,
+    },
   );
 
   return responseData;
@@ -519,8 +530,12 @@ async function extractWeeklyScheduleInPage(context) {
 
 function buildSubmission({ context, date, extractedData }) {
   console.log(
-    "[weekly-schedule-submission] Building submission with extractedData:",
-    extractedData,
+    "[weekly-schedule-submission] Building submission:",
+    {
+      date,
+      serviceAreaId: context.serviceAreaId,
+      employees: extractedData?.number_of_employees || 0,
+    },
   );
 
   const submission = {
@@ -537,8 +552,12 @@ function buildSubmission({ context, date, extractedData }) {
   };
 
   console.log(
-    "[weekly-schedule-submission] Final submission body:",
-    submission.body,
+    "[weekly-schedule-submission] Final submission summary:",
+    {
+      date: submission.body.date,
+      serviceAreaId: submission.body.serviceAreaId,
+      number_of_employees: submission.body.number_of_employees,
+    },
   );
 
   return submission;
