@@ -49,8 +49,32 @@ async function extractWeeklyScheduleInPage(context) {
     });
   }
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   function normalizeText(value) {
     return (value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function getElementText(element) {
+    return normalizeText(element?.innerText || element?.textContent || "");
+  }
+
+  function extractHoursWorkedValue(text) {
+    const match = normalizeText(text).match(
+      /([\d.]+\s*(?:hours?|hrs?|h)(?:\s*[\d.]+\s*(?:minutes?|mins?|m))?)/i,
+    );
+
+    return normalizeText(match?.[1] || "");
+  }
+
+  function extractLabeledHoursWorkedValue(text) {
+    const match = normalizeText(text).match(
+      /hours\s*worked:?\s*([\d.]+\s*(?:hours?|hrs?|h)(?:\s*[\d.]+\s*(?:minutes?|mins?|m))?)/i,
+    );
+
+    return normalizeText(match?.[1] || "");
   }
 
   function isVisible(element) {
@@ -69,6 +93,25 @@ async function extractWeeklyScheduleInPage(context) {
   function isTimeRangeText(value) {
     return /\b\d{1,2}:\d{2}(am|pm)\s*-\s*\d{1,2}:\d{2}(am|pm)\b/i.test(
       normalizeText(value),
+    );
+  }
+
+  function normalizeTimeRange(value) {
+    return normalizeText(value)
+      .toLowerCase()
+      .replace(/[–—]/g, "-")
+      .replace(/\s+/g, "")
+      .replace(/\b0(\d:)/g, "$1");
+  }
+
+  function popupMatchesEntry(popup, entry) {
+    const popupText = getElementText(popup);
+    if (!popupText) {
+      return false;
+    }
+
+    return normalizeTimeRange(popupText).includes(
+      normalizeTimeRange(entry.timeRange),
     );
   }
 
@@ -172,43 +215,123 @@ async function extractWeeklyScheduleInPage(context) {
       return null;
     }
 
-    const candidates = [
+    const clickTargets = [
       timeNode.closest('[role="button"]'),
       timeNode.closest("button"),
       timeNode.closest("div[style*='justify-content']"),
       timeNode.closest("div[style*='position: relative']"),
       timeNode.parentElement,
       timeNode,
-    ].filter(Boolean);
+    ].filter(Boolean).filter(
+      (node, index, nodes) => nodes.indexOf(node) === index,
+    );
 
     return {
       timeNode,
-      clickTarget: candidates[0],
+      clickTargets,
       timeRange: normalizeText(
         timeNode.getAttribute("title") || timeNode.textContent,
       ),
     };
   }
 
-  function clickEntry(entry) {
-    entry.clickTarget.scrollIntoView?.({ block: "center", inline: "center" });
+  function clickElement(element) {
+    element.scrollIntoView?.({ block: "center", inline: "center" });
+    const rect = element.getBoundingClientRect();
+    const clientX = Math.max(
+      0,
+      Math.min(window.innerWidth - 1, rect.left + rect.width / 2),
+    );
+    const clientY = Math.max(
+      0,
+      Math.min(window.innerHeight - 1, rect.top + rect.height / 2),
+    );
+    const eventTarget = document.elementFromPoint(clientX, clientY) || element;
+    const eventOptions = {
+      bubbles: true,
+      cancelable: true,
+      clientX,
+      clientY,
+      view: window,
+    };
+
     if (typeof PointerEvent === "function") {
-      entry.clickTarget.dispatchEvent(
+      eventTarget.dispatchEvent(new PointerEvent("pointerdown", eventOptions));
+    }
+    eventTarget.dispatchEvent(new MouseEvent("mousedown", eventOptions));
+    if (typeof PointerEvent === "function") {
+      eventTarget.dispatchEvent(new PointerEvent("pointerup", eventOptions));
+    }
+    eventTarget.dispatchEvent(new MouseEvent("mouseup", eventOptions));
+    eventTarget.click?.();
+  }
+
+  function clickShiftElement(element) {
+    element.scrollIntoView?.({ block: "center", inline: "center" });
+    if (typeof PointerEvent === "function") {
+      element.dispatchEvent(
         new PointerEvent("pointerdown", { bubbles: true, cancelable: true }),
       );
     }
-    entry.clickTarget.dispatchEvent(
+    element.dispatchEvent(
       new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
     );
-    entry.clickTarget.dispatchEvent(
+    element.dispatchEvent(
       new MouseEvent("mouseup", { bubbles: true, cancelable: true }),
     );
     if (typeof PointerEvent === "function") {
-      entry.clickTarget.dispatchEvent(
+      element.dispatchEvent(
         new PointerEvent("pointerup", { bubbles: true, cancelable: true }),
       );
     }
-    entry.clickTarget.click?.();
+    element.click?.();
+  }
+
+  function centerRow(rowRoot) {
+    rowRoot.scrollIntoView?.({ block: "center", inline: "nearest" });
+  }
+
+  function hasTimeRangeInside(element) {
+    return Array.from(element.querySelectorAll("p[title]")).some((node) =>
+      isTimeRangeText(node.getAttribute("title") || node.textContent),
+    );
+  }
+
+  function findEmptyScheduleCell(...roots) {
+    for (const root of roots.filter(Boolean)) {
+      const candidates = Array.from(
+        root.querySelectorAll(
+          "div.css-1uuroi8, div[style*='position: relative'], div[style*='min-height']",
+        ),
+      )
+        .filter((node) => {
+          if (!isVisible(node) || hasTimeRangeInside(node)) {
+            return false;
+          }
+
+          const text = getElementText(node);
+          const rect = node.getBoundingClientRect();
+          return (
+            rect.width >= 32 &&
+            rect.height >= 32 &&
+            rect.width <= 320 &&
+            rect.height <= 220 &&
+            !text.includes("@") &&
+            !/hours\s*worked/i.test(text)
+          );
+        })
+        .sort((left, right) => {
+          const leftRect = left.getBoundingClientRect();
+          const rightRect = right.getBoundingClientRect();
+          return leftRect.width * leftRect.height - rightRect.width * rightRect.height;
+        });
+
+      if (candidates.length) {
+        return candidates[0];
+      }
+    }
+
+    return null;
   }
 
   function findPopupContainer() {
@@ -228,7 +351,27 @@ async function extractWeeklyScheduleInPage(context) {
       ? fallbackRoots
       : [document.body];
     const seen = new Set();
+    const seenCandidates = new Set();
     const fallbackCandidates = [];
+
+    function findSmallestPopupRoot(node) {
+      let current = node;
+
+      while (current && current !== document.body) {
+        const text = getElementText(current);
+
+        if (
+          /hours\s*worked/i.test(text) &&
+          extractLabeledHoursWorkedValue(text)
+        ) {
+          return current;
+        }
+
+        current = current.parentElement;
+      }
+
+      return node;
+    }
 
     fallbackSearchRoots.forEach((root) => {
       const nodes = root === document.body
@@ -241,7 +384,11 @@ async function extractWeeklyScheduleInPage(context) {
 
         const text = normalizeText(node.textContent || "").toLowerCase();
         if (text.includes("hours worked")) {
-          fallbackCandidates.push(node);
+          const candidate = findSmallestPopupRoot(node);
+          if (!seenCandidates.has(candidate)) {
+            seenCandidates.add(candidate);
+            fallbackCandidates.push(candidate);
+          }
         }
       });
     });
@@ -257,7 +404,7 @@ async function extractWeeklyScheduleInPage(context) {
     )[0];
   }
 
-  async function waitForPopupContainer(timeoutMs = 4000) {
+  async function waitForPopupContainer(timeoutMs = 2500) {
     return new Promise((resolve) => {
       let settled = false;
       let settleTimeoutId = null;
@@ -300,28 +447,93 @@ async function extractWeeklyScheduleInPage(context) {
     });
   }
 
-  function extractHoursWorked(popup) {
-    const paragraphs = Array.from(popup.querySelectorAll("p")).map((node) =>
-      normalizeText(node.textContent || ""),
-    );
+  async function openPopupForEntry(entry) {
+    for (const [targetIndex, clickTarget] of entry.clickTargets.entries()) {
+      clickShiftElement(clickTarget);
+      let popup = await waitForPopupContainer();
 
-    const labelIndex = paragraphs.findIndex((text) => text === "Hours Worked");
-    if (labelIndex !== -1) {
-      return paragraphs[labelIndex + 1] || "";
+      if (popup) {
+        return popup;
+      }
+
+      console.warn(
+        "[weekly-schedule-page] Shift click target did not open popup:",
+        `targetIndex=${targetIndex}`,
+        entry.timeRange,
+        getElementText(clickTarget),
+      );
+      await sleep(150);
     }
 
-    const popupText = normalizeText(popup.textContent || "");
-    const hoursMatch = popupText.match(/hours worked\s*([\d.]+\s*h(?:r)?)/i);
-    return normalizeText(hoursMatch?.[1] || "");
+    return null;
+  }
+
+  function extractHoursWorked(popup) {
+    const visibleTexts = Array.from(
+      popup.querySelectorAll("p, span, div"),
+    ).map((node) => getElementText(node)).filter(Boolean);
+
+    const labelIndex = visibleTexts.findIndex((text) =>
+      /^hours\s*worked:?$/i.test(text),
+    );
+
+    if (labelIndex !== -1) {
+      const valueAfterLabel = visibleTexts
+        .slice(labelIndex + 1)
+        .map((text) => extractHoursWorkedValue(text))
+        .find(Boolean);
+
+      if (valueAfterLabel) {
+        return valueAfterLabel;
+      }
+    }
+
+    const labeledValue = visibleTexts
+      .map((text) => extractLabeledHoursWorkedValue(text))
+      .find(Boolean);
+
+    if (labeledValue) {
+      return labeledValue;
+    }
+
+    return extractLabeledHoursWorkedValue(getElementText(popup));
   }
 
   function findOpenPopupContainer() {
     return findPopupContainer();
   }
 
-  async function closePopup(popupToClose = findOpenPopupContainer()) {
+  async function waitForNoPopup(timeoutMs = 1200) {
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      const popup = findOpenPopupContainer();
+      if (!popup) {
+        return true;
+      }
+
+      await sleep(100);
+    }
+
+    return !findOpenPopupContainer();
+  }
+
+  async function closePopup(
+    popupToClose = findOpenPopupContainer(),
+    outsideClickTarget = null,
+  ) {
     if (!popupToClose) {
       return;
+    }
+
+    if (outsideClickTarget) {
+      clickElement(outsideClickTarget);
+      await sleep(150);
+
+      if (!popupToClose.isConnected || !isVisible(popupToClose)) {
+        await waitForNoPopup();
+        return;
+      }
     }
 
     document.dispatchEvent(
@@ -338,6 +550,8 @@ async function extractWeeklyScheduleInPage(context) {
         cancelable: true,
       }),
     );
+
+    document.body.click?.();
 
     await new Promise((resolve) => {
       let settled = false;
@@ -377,6 +591,8 @@ async function extractWeeklyScheduleInPage(context) {
 
       settleTimeoutId = setTimeout(finish, 1500);
     });
+
+    await waitForNoPopup();
   }
 
   function extractDateHeaders() {
@@ -423,11 +639,18 @@ async function extractWeeklyScheduleInPage(context) {
 
   const collectedEntries = [];
   let openPopup = findOpenPopupContainer();
+  if (openPopup) {
+    await closePopup(openPopup, findEmptyScheduleCell(sectionRoot));
+    openPopup = null;
+  }
 
   for (const rowRoot of employeeRows) {
     const employeeName = getEmployeeName(rowRoot);
     const employeeIdentity = getEmployeeIdentity(rowRoot);
     const dayCells = getDayCells(rowRoot);
+    const emptyCell = findEmptyScheduleCell(rowRoot, sectionRoot);
+    centerRow(rowRoot);
+    await sleep(100);
 
     console.log(
       "[weekly-schedule-page] Processing employee:",
@@ -443,12 +666,25 @@ async function extractWeeklyScheduleInPage(context) {
       }
 
       if (openPopup) {
-        await closePopup(openPopup);
+        await closePopup(openPopup, emptyCell);
         openPopup = null;
       }
 
-      clickEntry(entry);
-      const popup = await waitForPopupContainer();
+      let popup = await openPopupForEntry(entry);
+
+      if (!popup) {
+        const unmatchedPopup = findOpenPopupContainer();
+        if (unmatchedPopup) {
+          console.warn(
+            "[weekly-schedule-page] Unexpected popup remained after click retries:",
+            employeeName,
+            `dayIndex=${dayIndex}`,
+            entry.timeRange,
+            getElementText(unmatchedPopup),
+          );
+          await closePopup(unmatchedPopup, emptyCell);
+        }
+      }
 
       if (!popup) {
         console.warn(
@@ -457,17 +693,35 @@ async function extractWeeklyScheduleInPage(context) {
           `dayIndex=${dayIndex}`,
           entry.timeRange,
         );
-        continue;
       }
 
-      openPopup = popup;
+      if (popup) {
+        openPopup = popup;
+        if (!popupMatchesEntry(popup, entry)) {
+          console.warn(
+            "[weekly-schedule-page] Popup opened but time range was not found in popup text:",
+            employeeName,
+            `dayIndex=${dayIndex}`,
+            entry.timeRange,
+            getElementText(popup),
+          );
+        }
+      }
+
+      const hoursWorked = popup ? extractHoursWorked(popup) : "";
+      if (popup && !hoursWorked) {
+        console.warn(
+          "[weekly-schedule-page] Hours Worked not found in popup:",
+          getElementText(popup),
+        );
+      }
 
       const columnIndex = getColumnIndexFromCell(dayCell);
       const record = {
         employeeName,
         employeeIdentity,
         date: dateHeaders[columnIndex] || "",
-        hoursWorked: extractHoursWorked(popup),
+        hoursWorked,
         timeRange: entry.timeRange,
       };
 
@@ -479,11 +733,16 @@ async function extractWeeklyScheduleInPage(context) {
           collectedEntries.length,
         );
       }
+
+      if (openPopup) {
+        await closePopup(openPopup, emptyCell);
+        openPopup = null;
+      }
     }
   }
 
   if (openPopup) {
-    await closePopup(openPopup);
+    await closePopup(openPopup, findEmptyScheduleCell(sectionRoot));
   }
 
   console.log(
