@@ -3,13 +3,14 @@ console.log("BACKGROUND>JS started");
 import { FLOW_REGISTRY } from "./flows/index.js";
 
 const DEFAULT_FLOW_TYPE = "extract-route-assignments-data";
+const activeDriverRuns = new Map();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function waitForTabComplete(tabId) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     function listener(updatedTabId, info) {
       if (updatedTabId === tabId && info.status === "complete") {
         chrome.tabs.onUpdated.removeListener(listener);
@@ -18,6 +19,20 @@ function waitForTabComplete(tabId) {
     }
 
     chrome.tabs.onUpdated.addListener(listener);
+
+    // The tab may have finished loading before the listener was attached.
+    chrome.tabs
+      .get(tabId)
+      .then((tab) => {
+        if (tab.status === "complete") {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      })
+      .catch((error) => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        reject(error);
+      });
   });
 }
 
@@ -78,7 +93,7 @@ function buildFlowContext(payload) {
   return { flow, context };
 }
 
-async function executeFlowForDate(flow, context, date) {
+async function executeFlowForDate(flow, context, date, onResult) {
   const url = flow.buildUrl({
     baseUrl: context.baseUrl,
     date,
@@ -90,8 +105,12 @@ async function executeFlowForDate(flow, context, date) {
 
   const tab = await chrome.tabs.create({
     url,
-    active: Boolean(context.debugActiveTab),
+    active: flow.type === "extract-da-itineraries-data"
+      ? false
+      : Boolean(context.debugActiveTab),
   });
+  const runId = flow.submitPerDriver ? crypto.randomUUID() : null;
+  let daKeepAliveId;
 
   console.log(
     `[${context.flowType}] Created tab ${tab.id} with initial URL:`,
@@ -117,6 +136,25 @@ async function executeFlowForDate(flow, context, date) {
 
     await ensureExpectedTabUrl(flow, context, tab.id, url, date);
 
+    if (runId) {
+      activeDriverRuns.set(runId, {
+        flow,
+        context,
+        date,
+        tabId: tab.id,
+        nextSubmissionAt: 0,
+        inFlight: false,
+      });
+    }
+    if (flow.type === "extract-da-itineraries-data") {
+      // Keep the in-memory run and pending API retries alive until extraction ends.
+      // This timer runs in the worker, independently of the Amazon tab's timers.
+      daKeepAliveId = setInterval(() => {
+        chrome.runtime.getPlatformInfo().catch((error) => {
+          console.warn("Could not keep the active DA extraction worker alive:", error);
+        });
+      }, 25000);
+    }
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: flow.extractInPage,
@@ -126,6 +164,11 @@ async function executeFlowForDate(flow, context, date) {
           flowType: context.flowType,
           serviceAreaId: context.serviceAreaId,
           token: context.token,
+          ...(flow.type === "extract-da-itineraries-data" &&
+          context.period !== undefined
+            ? { period: context.period }
+            : {}),
+          ...(runId ? { runId } : {}),
         },
       ],
     });
@@ -134,12 +177,14 @@ async function executeFlowForDate(flow, context, date) {
     console.log(`[${context.flowType}] executeScript result wrapper:`, result);
     console.log(`[${context.flowType}] Extracted data:`, extractedData);
 
-    await submitFlowResult(flow, context, {
-      date,
-      extractedData,
-      url,
-    });
+    if (!flow.submitPerDriver) {
+      await submitFlowResult(flow, context, { date, extractedData, url });
+    }
+    // Report the extraction outcome before optional debug waits and tab cleanup.
+    if (onResult) await onResult(extractedData);
   } finally {
+    if (daKeepAliveId !== undefined) clearInterval(daKeepAliveId);
+    if (runId) activeDriverRuns.delete(runId);
     const keepTabOpenMs = Number(context.keepTabOpenMs || 0);
 
     if (keepTabOpenMs > 0) {
@@ -149,18 +194,25 @@ async function executeFlowForDate(flow, context, date) {
       await sleep(keepTabOpenMs);
     }
 
-    if (context.closeTab === false) {
+    const closeTab = context.closeTab ?? flow.closeTabByDefault ?? true;
+    if (closeTab === false) {
       console.log(
         `[${context.flowType}] Leaving tab ${tab.id} open for debugging`,
       );
-      return;
+    } else {
+      await chrome.tabs.remove(tab.id);
     }
-
-    await chrome.tabs.remove(tab.id);
   }
 }
 
 async function submitFlowResult(flow, context, runResult) {
+  if (typeof flow.buildSubmission !== "function") {
+    console.log(
+      `[${context.flowType}] Console-only flow completed; no submission configured`,
+    );
+    return;
+  }
+
   const submission = flow.buildSubmission({
     context,
     date: runResult.date,
@@ -168,6 +220,98 @@ async function submitFlowResult(flow, context, runResult) {
     url: runResult.url,
   });
 
+  if (Array.isArray(submission)) {
+    await submitBatches(flow, context, submission);
+    return;
+  }
+
+  await sendSubmission(context, submission);
+}
+
+async function submitBatches(flow, context, submissions) {
+  const delayMs = flow.betweenSubmissionsDelayMs ?? 5000;
+  const maxRetries = flow.maxSubmissionRetries ?? 0;
+  const statuses = [];
+
+  if (!submissions.length) {
+    console.log(`[${context.flowType}] No driver batches to submit`);
+    return statuses;
+  }
+
+  for (const [index, submission] of submissions.entries()) {
+    if (index > 0) await sleep(delayMs);
+    console.log(
+      `[${context.flowType}] Submitting batch ${index + 1}/${submissions.length}`,
+    );
+
+    for (let attempt = 0; ; attempt += 1) {
+      const response = await sendSubmission(context, submission);
+      if (response.ok) {
+        statuses.push(response.status);
+        break;
+      }
+
+      if (response.status !== 429 || attempt >= maxRetries) {
+        const error = new Error(
+          `Batch ${index + 1}/${submissions.length} submission failed: HTTP ${response.status}`,
+        );
+        error.status = response.status;
+        throw error;
+      }
+
+      const retryAfter = response.headers.get("Retry-After");
+      let retryAfterMs = 0;
+      if (retryAfter) {
+        const seconds = Number(retryAfter);
+        retryAfterMs = Number.isFinite(seconds)
+          ? seconds * 1000
+          : Date.parse(retryAfter) - Date.now();
+      }
+      const waitMs = Math.max(
+        delayMs * 2 ** attempt,
+        Number.isFinite(retryAfterMs) ? retryAfterMs : 0,
+      );
+      console.warn(
+        `[${context.flowType}] Batch ${index + 1} rate limited; retry ${attempt + 1}/${maxRetries} in ${waitMs}ms`,
+      );
+      await sleep(waitMs);
+    }
+  }
+  return statuses;
+}
+
+async function submitDriverRoute(message, sender) {
+  const run = activeDriverRuns.get(message.runId);
+  if (!run || sender.tab?.id !== run.tabId) {
+    throw new Error(
+      "Driver submission does not belong to an active extraction tab",
+    );
+  }
+  if (run.inFlight)
+    throw new Error("A driver submission is already in progress");
+  run.inFlight = true;
+  try {
+    const submission = run.flow.buildSubmission({
+      context: run.context,
+      date: run.date,
+      extractedData: {
+        route: message.route,
+        totalDrivers: message.totalDrivers,
+        driverNumber: message.driverNumber,
+      },
+    });
+    const waitMs = run.nextSubmissionAt - Date.now();
+    if (waitMs > 0) await sleep(waitMs);
+    const [status] = await submitBatches(run.flow, run.context, [submission]);
+    return { success: true, status };
+  } finally {
+    run.nextSubmissionAt =
+      Date.now() + (run.flow.betweenSubmissionsDelayMs ?? 5000);
+    run.inFlight = false;
+  }
+}
+
+async function sendSubmission(context, submission) {
   console.log(`[${context.flowType}] Submitting payload:`, submission.body);
 
   const response = await fetch(submission.url, {
@@ -179,9 +323,76 @@ async function submitFlowResult(flow, context, runResult) {
   const responseBody = await response.text();
   console.log(`[${context.flowType}] Submission status:`, response.status);
   console.log(`[${context.flowType}] Submission body:`, responseBody);
+  return response;
 }
 
-async function runExtraction(payload) {
+function buildDaCompletionMessage(context, date, result) {
+  const payload = {
+    flowType: "extract-da-itineraries-data",
+    date,
+    period: context.period ?? null,
+  };
+  const summary = result?.submissionSummary;
+  if (summary?.notProcessed > 0) {
+    return {
+      type: "AMAZON_EXTRACTION_FAILED",
+      payload: {
+        ...payload,
+        error:
+          result.submissionResults?.find(
+            (item) => item.stage === "not_processed",
+          )?.error ||
+          "DA extraction stopped before all discovered drivers could be attempted",
+      },
+    };
+  }
+  if (
+    !Number.isInteger(result?.totalDrivers) ||
+    result.totalDrivers < 0 ||
+    !Number.isInteger(summary?.successful) ||
+    summary.successful < 0 ||
+    !Number.isInteger(summary?.failed) ||
+    summary.failed < 0 ||
+    summary.successful + summary.failed !== result.totalDrivers
+  ) {
+    return {
+      type: "AMAZON_EXTRACTION_FAILED",
+      payload: {
+        ...payload,
+        error: "DA extraction did not return a valid final summary",
+      },
+    };
+  }
+  return {
+    type: "AMAZON_EXTRACTION_COMPLETE",
+    payload: {
+      ...payload,
+      totalDrivers: result.totalDrivers,
+      successfulDrivers: summary.successful,
+      failedDrivers: summary.failed,
+    },
+  };
+}
+
+async function notifyDaOrigin(origin, message) {
+  if (origin?.tabId == null) return; // Toolbar runs have no originating webpage.
+  try {
+    await chrome.tabs.sendMessage(origin.tabId, message, {
+      frameId: origin.frameId,
+      ...(origin.documentId ? { documentId: origin.documentId } : {}),
+    });
+  } catch (error) {
+    // A closed/reloaded app page must not change extraction or submission behavior.
+    console.warn(
+      "Could not deliver DA extraction notification to the originating page:",
+      error,
+    );
+  }
+}
+
+async function runExtraction(payload, origin) {
+  let currentDate = payload?.dates?.[0] ?? null;
+  let dateReported = false;
   try {
     const { flow, context } = buildFlowContext(payload);
     console.log(
@@ -190,38 +401,79 @@ async function runExtraction(payload) {
     );
 
     for (const date of context.dates) {
-      await executeFlowForDate(flow, context, date);
+      currentDate = date;
+      dateReported = false;
+      const onResult =
+        flow.type === "extract-da-itineraries-data"
+          ? async (result) => {
+              const message = buildDaCompletionMessage(context, date, result);
+              dateReported = true;
+              await notifyDaOrigin(origin, message);
+            }
+          : undefined;
+      await executeFlowForDate(flow, context, date, onResult);
       await sleep(flow.betweenDatesDelayMs ?? 1000);
     }
 
     console.log(`[${context.flowType}] Batch extraction completed`);
   } catch (error) {
+    if (payload?.flowType === "extract-da-itineraries-data" && !dateReported) {
+      await notifyDaOrigin(origin, {
+        type: "AMAZON_EXTRACTION_FAILED",
+        payload: {
+          flowType: "extract-da-itineraries-data",
+          date: currentDate,
+          period: payload.period ?? null,
+          error: error?.message || String(error),
+        },
+      });
+    }
     console.error("runExtraction failed:", error);
   }
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "SUBMIT_DA_ROUTE") {
+    submitDriverRoute(message, sender).then(sendResponse, (error) =>
+      sendResponse({
+        success: false,
+        status: error.status ?? null,
+        error: error.message,
+      }),
+    );
+    return true;
+  }
   if (
     message.type === "START_AMAZON_EXTRACTION" ||
     message.type === "START_FLOW"
   ) {
-    runExtraction(message.payload);
+    const origin = sender.tab
+      ? {
+          tabId: sender.tab.id,
+          frameId: sender.frameId ?? 0,
+          documentId: sender.documentId,
+        }
+      : undefined;
+    runExtraction(message.payload, origin);
   }
 });
 
 chrome.action.onClicked.addListener(() => {
   runExtraction({
-    flowType: "extract-work-summary-tool-data",
+    flowType: "extract-da-itineraries-data",
+    //flowType: "extract-work-summary-tool-data",
     //flowType: "extract-route-assignments-data",
     //flowType: "extract-weekly-schedule",
     serviceAreaId: "221c60b4-2825-4fdf-80de-360cdc73e8f4",
     baseUrl:
-      "https://logistics.amazon.com/harmony/v2/#!/dsp-portal?serviceAreaId={serviceAreaId}&localDate={date}",
+      "https://logistics.amazon.com/operations/execution/dv/routes?navMenuVariant=external&provider=ALL_DRIVERS&selectedDay={date}&serviceAreaId={serviceAreaId}",
+    //"https://logistics.amazon.com/harmony/v2/#!/dsp-portal?serviceAreaId={serviceAreaId}&localDate={date}",
     //"https://logistics.amazon.com/scheduling?serviceAreaId={serviceAreaId}&date={date}",
     //"https://logistics.amazon.com/scheduling/calendar-view/week?date={date}&serviceAreaId={serviceAreaId}",
-    dates: ["2026-04-24"],
+    dates: ["2026-09-13"],
+    period: "6a36db1aa9724742475c5457", // DA itineraries only; ignored by the other flows.
     token: "test-token",
     debugActiveTab: true,
-    keepTabOpenMs: 60000,
+    closeTab: false,
   });
 });

@@ -1,6 +1,20 @@
 console.log("✅ content.js injected");
 console.log("chrome.runtime:", chrome.runtime);
 
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (
+    message?.payload?.flowType === "extract-da-itineraries-data" &&
+    (message.type === "AMAZON_EXTRACTION_COMPLETE" ||
+      message.type === "AMAZON_EXTRACTION_FAILED")
+  ) {
+    window.postMessage(
+      { type: message.type, payload: message.payload },
+      window.location.origin,
+    );
+    sendResponse({ received: true });
+  }
+});
+
 window.addEventListener("message", (event) => {
   if (event.data?.type === "START_AMAZON_EXTRACTION") {
     try {

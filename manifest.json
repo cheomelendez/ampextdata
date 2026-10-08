@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Route Assignment Extractor",
+  "name": "AMP Extractor",
   "version": "1.0",
   "permissions": ["tabs", "scripting"],
   "host_permissions": [
@@ -8,12 +8,18 @@
     "https://recon.amngtpro.com/*",
     "https://candidate-dashboard-integration.free.beeceptor.com/*"
   ],
+  "icons": {
+    "128": "extract.png"
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
-    "default_title": "Run Extraction"
+    "default_title": "Run Extraction",
+    "default_icon": {
+      "128": "extract.png"
+    }
   },
   "content_scripts": [
     {
