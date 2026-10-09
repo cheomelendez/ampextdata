@@ -4,6 +4,8 @@ import { FLOW_REGISTRY } from "./flows/index.js";
 
 const DEFAULT_FLOW_TYPE = "extract-route-assignments-data";
 const activeDriverRuns = new Map();
+// Keep the DA API's rejection reason after the response body has been read.
+const daSubmissionErrors = new WeakMap();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -252,8 +254,10 @@ async function submitBatches(flow, context, submissions) {
       }
 
       if (response.status !== 429 || attempt >= maxRetries) {
+        const details = daSubmissionErrors.get(response);
         const error = new Error(
-          `Batch ${index + 1}/${submissions.length} submission failed: HTTP ${response.status}`,
+          `Batch ${index + 1}/${submissions.length} submission failed: HTTP ${response.status}` +
+            (details ? `; API response: ${details}` : ""),
         );
         error.status = response.status;
         throw error;
@@ -321,6 +325,16 @@ async function sendSubmission(context, submission) {
   });
 
   const responseBody = await response.text();
+  if (context.flowType === "extract-da-itineraries-data" && !response.ok) {
+    // Relay a bounded diagnostic through the existing error message to the
+    // extraction tab. This does not change the request payload or retry policy.
+    const limit = 4000;
+    const details = responseBody.trim();
+    daSubmissionErrors.set(
+      response,
+      details.length > limit ? `${details.slice(0, limit)}… [truncated]` : details,
+    );
+  }
   console.log(`[${context.flowType}] Submission status:`, response.status);
   console.log(`[${context.flowType}] Submission body:`, responseBody);
   return response;

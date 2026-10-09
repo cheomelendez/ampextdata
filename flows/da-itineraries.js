@@ -17,7 +17,9 @@ async function extractDaItinerariesInPage(context) {
   const MAX_DRIVERS = 100;
   const DRIVER_LIST_TIMEOUT_MS = 30000;
   const DRIVER_ROWS_TIMEOUT_MS = 30000;
-  const DIAGNOSTIC_VERSION = "da-local-polling-v5";
+  const RETURN_LIST_TIMEOUT_MS = 60000;
+  const RETURN_LIST_ATTEMPTS = 3;
+  const DIAGNOSTIC_VERSION = "da-return-list-recovery-v7";
 
   const result = {
     status: "DA itineraries page script started",
@@ -78,7 +80,8 @@ async function extractDaItinerariesInPage(context) {
   }
 
   const driverRowSelector =
-    '.meridian-itinerary-summary-list-item[class*="transporter-"]';
+    '.meridian-itinerary-summary-list-item[class*="transporter-"], ' +
+    '.meridian-itinerary-summary-list-item[class*="route-"]';
 
   function sleep(ms) {
     // DOM polling must not depend on an extension message channel staying open.
@@ -99,16 +102,36 @@ async function extractDaItinerariesInPage(context) {
       const itineraryId = classes
         .find((name) => name.startsWith("itinerary-"))
         ?.slice("itinerary-".length);
+      const routeId = classes
+        .find((name) => name.startsWith("route-"))
+        ?.slice("route-".length);
+      const texts = Array.from(row.querySelectorAll("p"), (node) =>
+        normalizeText(node.textContent),
+      );
       const indexValue = row
         .closest("[data-item-index]")
         ?.getAttribute("data-item-index");
       const index = indexValue == null ? null : Number(indexValue);
       return {
-        key: `${transporterId}:${itineraryId || index}`,
+        key: transporterId
+          ? `${transporterId}:${itineraryId || index}`
+          : `route:${routeId}`,
         index,
+        summary: {
+          daProgress: {
+            stops:
+              texts.map((text) => parseProgress(text, "stops?")).find(Boolean) || null,
+            deliveries:
+              texts.map((text) => parseProgress(text, "deliver(?:y|ies)")).find(Boolean) || null,
+          },
+          appSignOut: texts
+            .map((text) => text.match(/^App sign out:\s*(\d{1,2}:\d{2}\s*[ap]m)\b/i))
+            .find(Boolean)?.[1] || null,
+        },
         driver: {
-          transporterId,
-          itineraryId,
+          transporterId: transporterId || null,
+          itineraryId: itineraryId || null,
+          ...(routeId ? { routeId } : {}),
           driverName: normalizeText(
             row.querySelector('[data-testid="allow-text-selection-div"] p')
               ?.textContent,
@@ -118,9 +141,8 @@ async function extractDaItinerariesInPage(context) {
     });
   }
 
-  function isDriverListAvailable(list) {
-    if (!list.isConnected || !list.querySelector(driverRowSelector))
-      return false;
+  function isListContainerAvailable(list) {
+    if (!list.isConnected) return false;
     // Readiness is based on DOM data, not a rendered rectangle. Exclude explicitly
     // hidden/stale panels while still allowing extraction in an inactive tab.
     for (let element = list; element; element = element.parentElement) {
@@ -136,6 +158,15 @@ async function extractDaItinerariesInPage(context) {
         return false;
     }
     return true;
+  }
+
+  function isDriverListAvailable(list) {
+    return isListContainerAvailable(list) && !!list.querySelector(driverRowSelector);
+  }
+
+  function isDriverRowReady({ driver, summary }) {
+    return driver.driverName &&
+      (driver.transporterId || (driver.routeId && summary.daProgress.deliveries));
   }
 
   function findDriverList() {
@@ -271,9 +302,7 @@ async function extractDaItinerariesInPage(context) {
       const signature = JSON.stringify(
         rows.map(({ key, index }) => [key, index]),
       );
-      const readyRows = rows.filter(
-        ({ driver }) => driver.driverName && driver.transporterId,
-      ).length;
+      const readyRows = rows.filter(isDriverRowReady).length;
       const allRowsReady = rows.length > 0 && readyRows === rows.length;
       if (signature !== previous) {
         previous = signature;
@@ -300,7 +329,7 @@ async function extractDaItinerariesInPage(context) {
     }
     logDriverListDiagnostics("driver-rows-timeout", [], readiness);
     throw new Error(
-      `Driver rows did not finish rendering within ${DRIVER_ROWS_TIMEOUT_MS / 1000} seconds (${readiness.readyRows}/${readiness.rowCount} rows have a name and transporter ID); see Driver list diagnostics`,
+      `Driver rows did not finish rendering within ${DRIVER_ROWS_TIMEOUT_MS / 1000} seconds (${readiness.readyRows}/${readiness.rowCount} rows have a name and transporter or route ID); see Driver list diagnostics`,
     );
   }
 
@@ -612,16 +641,93 @@ async function extractDaItinerariesInPage(context) {
     return route;
   }
 
+  async function waitForReturningDriverList(scrollTop) {
+    const startedAt = Date.now();
+    const deadline = startedAt + RETURN_LIST_TIMEOUT_MS;
+    const resetLists = new WeakSet();
+    let restoredPosition = false;
+    let previousList = null;
+    let previousSignature = "";
+    let stableSince = startedAt;
+    while (true) {
+      // Amazon can replace the entire list during navigation. Never keep polling
+      // a detached container, and require the new rows to settle before continuing.
+      const list = findDriverList();
+      if (list) {
+        if (!restoredPosition) {
+          const scroller = findScrollContainer(list);
+          if (scroller) scroller.scrollTo({ top: scrollTop, behavior: "instant" });
+          restoredPosition = true;
+        }
+        const rows = readDriverRows(list);
+        const signature = JSON.stringify(rows.map(({ key, index }) => [key, index]));
+        if (list !== previousList || signature !== previousSignature ||
+            !rows.length || !rows.every(isDriverRowReady)) {
+          stableSince = Date.now();
+        }
+        previousList = list;
+        previousSignature = signature;
+        if (rows.length && rows.every(isDriverRowReady) &&
+            Date.now() - stableSince >= 750) return list;
+      } else {
+        previousList = null;
+        stableSince = Date.now();
+        const url = new URL(window.location.href);
+        // Only nudge the summary view, never a driver's stop list or another date.
+        if (Date.now() - startedAt >= 2000 &&
+            url.pathname.replace(/\/$/, "").endsWith("/itineraries") &&
+            url.searchParams.get("selectedDay") === context.date) {
+          const emptyList = Array.from(document.querySelectorAll(
+            '[data-testid="virtuoso-item-list"]',
+          )).find((node) => isListContainerAvailable(node) &&
+            node.children.length === 0 && !resetLists.has(node));
+          if (emptyList) {
+            // An empty virtual list may have no scrollable height yet. Find its
+            // overflow container without requiring scrollHeight > clientHeight.
+            let scroller = emptyList.parentElement;
+            while (scroller && !/auto|scroll/.test(getComputedStyle(scroller).overflowY)) {
+              scroller = scroller.parentElement;
+            }
+            scroller ||= findScrollContainer(emptyList);
+            if (scroller) {
+              resetLists.add(emptyList);
+              scroller.scrollTo({ top: 0, behavior: "instant" });
+              scroller.dispatchEvent(new Event("scroll"));
+              // Stay at the recovered position; locateDriverLink restores the
+              // next driver's saved position when it searches for that driver.
+              restoredPosition = true;
+            }
+          }
+        }
+      }
+      if (Date.now() >= deadline) break;
+      await sleep(250);
+    }
+    throw new Error("Driver list did not become ready within 60 seconds");
+  }
+
   async function returnToDriverList(entry, scrollTop) {
-    const panel = findRoutePanel(entry.driver.transporterId);
-    const back = findDAsButton(panel || document);
-    if (!back) throw new Error("DAs/DPs back-to-list button not found");
-    back.click();
-    const list = await waitForDriverList();
-    const scroller = findScrollContainer(list);
-    if (scroller) scroller.scrollTo({ top: scrollTop, behavior: "instant" });
-    await waitForRenderedRows(list);
-    return list;
+    let lastError;
+    for (let attempt = 1; attempt <= RETURN_LIST_ATTEMPTS; attempt += 1) {
+      if (attempt > 1) {
+        console.warn(
+          `[da-itineraries-page] Recovering driver list after ${entry.driver.driverName}: attempt ${attempt}/${RETURN_LIST_ATTEMPTS}`,
+        );
+      }
+      try {
+        const panel = findRoutePanel(entry.driver.transporterId);
+        const back = findDAsButton(panel || document);
+        // Avoid restarting an already-selected summary view while it hydrates.
+        if (back && (panel || back.getAttribute("aria-selected") !== "true")) back.click();
+        const list = await waitForReturningDriverList(scrollTop);
+        if (attempt > 1) console.log("[da-itineraries-page] Driver list recovered; continuing with the next driver");
+        return list;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    logDriverListDiagnostics("return-list-recovery-exhausted");
+    throw new Error(`Cannot recover driver list after ${RETURN_LIST_ATTEMPTS} attempts: ${lastError.message}`);
   }
 
   async function countDriverRoster() {
@@ -638,9 +744,12 @@ async function extractDaItinerariesInPage(context) {
       if (scroller) scroller.scrollTo({ top: 0, behavior: "instant" });
       while (Date.now() < deadline) {
         for (const entry of await waitForRenderedRows(list)) {
-          if (!entry.driver.driverName || !entry.driver.transporterId) {
+          if (
+            !entry.driver.driverName ||
+            !(entry.driver.transporterId || entry.driver.routeId)
+          ) {
             throw new Error(
-              "A driver row is missing its name or transporter ID",
+              "A driver row is missing its name or transporter/route ID",
             );
           }
           if (!entries.has(entry.key)) {
@@ -728,6 +837,21 @@ async function extractDaItinerariesInPage(context) {
     throw new Error(`Route link not found for ${entry.driver.driverName}`);
   }
 
+  async function generateEmptyItineraryId(routeId) {
+    // A stable synthetic ID keeps retries/repeated syncs tied to the same
+    // planned route. Do not use the driver's name or processing order.
+    const identity = JSON.stringify([context.serviceAreaId, context.date, routeId]);
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(identity),
+    );
+    const hex = Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+    // Same 36-character / 8-4-4-4-12 shape, with an explicit synthetic prefix.
+    return `empty000-${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 24)}`;
+  }
+
   async function collectDrivers() {
     console.log("[da-itineraries-page] Counting drivers...");
     const roster = await countDriverRoster();
@@ -756,15 +880,43 @@ async function extractDaItinerariesInPage(context) {
       let scrollTop = entry.scrollTop;
       let navigationError = null;
       try {
-        const location = await locateDriverLink(entry);
-        scrollTop = location.scrollTop;
         console.log(
           `[da-itineraries-page] Driver ${index + 1}/${totalDrivers}: ${entry.driver.driverName}`,
         );
-        location.link.scrollIntoView({ block: "center", inline: "nearest" });
-        location.link.click();
-        opened = true;
-        const route = await extractDriverRoute(entry);
+        let route;
+        if (
+          !entry.driver.transporterId && entry.driver.routeId &&
+          entry.summary.daProgress.deliveries?.completed === 0
+        ) {
+          // Planned routes may have no assigned transporter/itinerary or detail
+          // page yet. Preserve the known totals without inventing stop records.
+          route = {
+            ...entry.driver,
+            transporterId: "",
+            itineraryId: entry.driver.itineraryId ||
+              await generateEmptyItineraryId(entry.driver.routeId),
+            appSignIn: null,
+            appSignOut: entry.summary.appSignOut,
+            daProgress: entry.summary.daProgress,
+            breaksTaken: { count: null, totalDuration: null, items: [] },
+            stops: [],
+            // Only summary data was available; this is not a full route extract.
+            complete: false,
+          };
+          console.log(
+            `[da-itineraries-page] Route extracted (summary only): ${route.driverName}`,
+            route,
+          );
+        } else {
+          const location = await locateDriverLink(entry);
+          scrollTop = location.scrollTop;
+          location.link.scrollIntoView({ block: "center", inline: "nearest" });
+          location.link.click();
+          opened = true;
+          route = await extractDriverRoute(entry);
+        }
+        outcome.itineraryId = route.itineraryId;
+        outcome.transporterId = route.transporterId;
         outcome.complete = route.complete;
         outcome.stage = "submission";
         // Await the background worker's HTTP result before opening another driver.
@@ -794,7 +946,7 @@ async function extractDaItinerariesInPage(context) {
             outcome.error,
           );
         }
-        if (opened) {
+        if (opened && index + 1 < selectedEntries.length) {
           try {
             await returnToDriverList(entry, scrollTop);
           } catch (error) {
@@ -843,7 +995,7 @@ async function extractDaItinerariesInPage(context) {
       ).length,
     };
     console.log(
-      `[da-itineraries-page] Submission summary: ${successful} successfully sent, ${submissionSummary.failed} failed (${totalDrivers} total drivers)`,
+      `[da-itineraries-page] Submission summary: ${successful} successfully sent, ${submissionSummary.submissionFailed} submission failures, ${submissionSummary.extractionFailed} extraction failures, ${submissionSummary.notProcessed} not processed (${totalDrivers} total drivers)`,
       submissionSummary,
     );
     return {
@@ -893,7 +1045,16 @@ async function extractDaItinerariesInPage(context) {
 }
 function buildSubmission({ context, date, extractedData }) {
   const { route, totalDrivers, driverNumber } = extractedData || {};
-  if (!route?.transporterId || !Array.isArray(route.stops)) {
+  const isUnstartedSummary =
+    route?.routeId && route.driverName &&
+    route.transporterId === "" &&
+    typeof route.itineraryId === "string" && route.itineraryId.trim() &&
+    route.daProgress?.deliveries?.completed === 0 &&
+    route.stops?.length === 0 && route.complete === false;
+  if (
+    (!route?.transporterId && !isUnstartedSummary) ||
+    !Array.isArray(route?.stops)
+  ) {
     throw new Error("DA itineraries submission requires one extracted route");
   }
   if (

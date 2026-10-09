@@ -1,0 +1,191 @@
+## 1. How Sync starts
+
+The Amazon tab builds one row for each date in the TSR period. A row shows **Sync** if that date has no Day Sync yet; it shows **Re-sync** only for `Failed`, `Interrupted`, or `CompletedWithErrors` runs. Either button is disabled while another sync is active. (`TsrAmazonDaUploadCard.jsx`, lines 19–23, 57–72; `TsrAmazonDayRow.jsx`, lines 25–26, 59–69; `amazonDaySyncStatus.js`, lines 12–14.)
+
+When clicked, the app calls `tsrAmazonStartSync` with the period ID, date, whether this is a re-sync, and the logged-in user’s session token. The backend validates the caller and company access, checks that the date is in the period, and creates a `TSRAmazonDaySync` in `Pending` status. (`useAmazonExtensionSync.js`, lines 111–129; `tsrAmazonStartSync/entry.ts`, lines 34–58, 94–113.)
+
+After that call returns, the app sends this actual message to the page’s extension listener:
+
+```javascript
+const payload = {
+  flowType: "extract-da-itineraries-data",
+  serviceAreaId, // returned by tsrAmazonStartSync from serviceAreaIDBoca
+  baseUrl,        // returned by tsrAmazonStartSync from basUrlItinerary
+  dates: [date],  // one selected date
+  period: periodId,
+  token           // one-hour sync JWT created by tsrAmazonStartSync
+};
+
+window.postMessage(
+  { type: "START_AMAZON_EXTRACTION", payload },
+  window.location.origin
+);
+```
+
+This structure and call are in `useAmazonExtensionSync.js`, lines 115–123; the flow type is in `amazonDaySyncStatus.js`, line 1. `periodId` comes from the period page; `date` comes from the clicked day row. The service area and `baseUrl` are configuration secrets read by the backend (`tsrAmazonStartSync/entry.ts`, lines 54–58), not values typed by the user. The token is generated for this run, not hardcoded.
+
+The sync JWT is signed using `JWT_SECRET` with HS256 and expires after one hour. Its claims bind it to the purpose `amazon_da_sync`, the period, date (`fileDate`), initiating user email, and that particular Day Sync record ID. This is a narrow ingestion credential: the receiver uses it to accept data for that run, rather than treating it as a user session. (`tsrAmazonStartSync/entry.ts`, lines 19–23, 109–113.)
+
+**Security note:** the JWT is sent to the extension in the page message, so the extension must treat it as sensitive. The receiver validates the signature and claims, but its CORS response allows any origin (`tsrAmazonReceiveDriver/entry.ts`, lines 28–32); authorization is enforced by the Bearer token and the run checks, not by CORS origin restriction.
+
+## 2. What happens after the extension starts
+
+The Base44-side flow is:
+
+`User clicks Sync → Base44 creates a Pending day sync and token → Base44 posts START_AMAZON_EXTRACTION → extension performs the Amazon extraction → extension POSTs each driver itinerary to Base44 → Base44 stores each driver and its detail rows → extension reports the overall result → Base44 finalizes the day status`
+
+The page listens for the extension’s completion/failure message, refreshes the Amazon tab periodically while a sync is active, and refreshes again after finalization. (`useAmazonExtensionSync.js`, lines 33–58, 102–109.)
+
+The extension implementation itself is **not included in the app files I inspected**. I can confirm the exact message Base44 sends and the shape its receiving function expects, but not how the extension navigates Amazon or extracts the data internally.
+
+## 3. Receiving API / backend function
+
+- **Function:** `tsrAmazonReceiveDriver`
+- **Endpoint:** `https://satisfied-route-sync-flow.base44.app/functions/tsrAmazonReceiveDriver`. This URL appears in the app’s debug modal (`TsrAmazonSyncDebugModal.jsx`, line 4); Base44 function URLs follow `/functions/<function-name>`.
+- **Authentication:** `Authorization: Bearer <sync token>`. The receiver verifies the JWT with `JWT_SECRET`, checks the expected purpose and required run claims, then checks the body’s date and optional period against the token. (`tsrAmazonReceiveDriver/entry.ts`, lines 49–61.)
+- **Run identification:** the token’s `daySyncId` finds the Day Sync; the function verifies that its stored period and date match the token. It then looks up the period to get the company ID. (`tsrAmazonReceiveDriver/entry.ts`, lines 67–76.)
+- **Acceptance/rejection:** accepted calls must contain exactly one driver with an `itineraryId`, and the Day Sync must still be `Pending` or `Syncing`. Bad or missing credentials are rejected; mismatched date/period, missing run, invalid driver count, missing itinerary ID, or a terminal sync status are also rejected. Successful responses come after route, stops, and breaks have been persisted. (`tsrAmazonReceiveDriver/entry.ts`, lines 51–70, 145–193.)
+
+`serviceAreaId` is included in the extension start message, but the receiver does **not** validate it from the posted driver payload. It identifies the company from the stored period instead.
+
+## 4. Example received data
+
+The receiver’s documented and parsed structure is one driver per request (`tsrAmazonReceiveDriver/entry.ts`, lines 8–16):
+
+```json
+{
+  "date": "2026-10-07",
+  "serviceAreaId": "SERVICE_AREA_VALUE",
+  "period": "period_abc123",
+  "totalDrivers": 42,
+  "complete": true,
+  "drivers": [
+    {
+      "driverName": "Jordan Lee",
+      "transporterId": "T12345",
+      "itineraryId": "ITIN-20261007-001",
+      "appSignIn": "7:02am",
+      "appSignOut": "5:18pm",
+      "complete": true,
+      "daProgress": {
+        "stops": { "completed": 154, "total": 154 },
+        "deliveries": { "completed": 188, "total": 188 }
+      },
+      "breaksTaken": {
+        "count": 1,
+        "totalDuration": "30m",
+        "items": [
+          {
+            "label": "Lunch",
+            "afterStop": 75,
+            "startTime": "12:10pm",
+            "endTime": "12:40pm",
+            "duration": "30m"
+          }
+        ]
+      },
+      "stops": [
+        {
+          "stopNumber": 1,
+          "routeCode": "R-01",
+          "address": "10 Main St",
+          "plannedTime": "8:05am",
+          "time": "8:02am",
+          "type": "Delivery",
+          "quantity": "1/1",
+          "summary": "Delivered"
+        },
+        {
+          "stopNumber": 2,
+          "routeCode": "R-01",
+          "address": "12 Main St",
+          "plannedTime": "8:12am",
+          "time": "8:15am",
+          "type": "Delivery",
+          "quantity": "2/2",
+          "summary": "Delivered"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`date` and `period` identify the date and period being ingested; the receiver checks them against the token. `serviceAreaId` is sent to the extension, but is not used by the receiver to select the company. `drivers` contains exactly one itinerary in each accepted request. The driver fields identify the itinerary, driver, punches, progress, breaks, and stops. `batchNumber` and `totalBatches` are **not** documented, read, or used by this receiver; it instead reads `totalDrivers` and requires one driver per request. (`tsrAmazonReceiveDriver/entry.ts`, lines 58–65.)
+
+A driver’s `complete` value is converted to that route’s `routeComplete` field. It does **not** mean the whole day’s sync is finished. Overall daily completion is reported separately with the `AMAZON_EXTRACTION_COMPLETE` or `AMAZON_EXTRACTION_FAILED` message. The receiver also accepts a top-level `complete` in the request contract comment, but the code does not use that field to finalize the day. (`tsrAmazonReceiveDriver/entry.ts`, lines 9–16, 119–120.)
+
+## 5. How the data is stored
+
+Yes: these four entities are the receiver’s storage chain. There are **four entities**, but Stops and Breaks are both children of a Driver Route; Breaks are not nested beneath Stops.
+
+```text
+TSRAmazonDaySync
+└── TSRAmazonDriverRoute (one per itinerary in that sync)
+    ├── TSRAmazonStop (many stops for that route)
+    └── TSRAmazonBreak (many breaks for that route)
+```
+
+- **`TSRAmazonDaySync`**: one synchronization run for a period/date. Stores `tsrPeriodId`, `companyId` (looked up from the period), `date`, `serviceAreaId`, `triggeredBy`, driver counters, status, and start/activity/completion timestamps. Created by `tsrAmazonStartSync`; later updated by receiver, finalizer, or stale-run handling. (`TSRAmazonDaySync.jsonc`, lines 5–67; `tsrAmazonStartSync/entry.ts`, lines 94–107.)
+- **`TSRAmazonDriverRoute`**: one driver itinerary, linked to the Day Sync by `amazonDaySyncId`. Stores period, company, work date, driver name, transporter ID, itinerary ID, sign-in/out, computed minutes/hours, route completeness, stop/delivery counts, break totals, and sync timestamp. (`TSRAmazonDriverRoute.jsonc`, lines 5–82.)
+- **`TSRAmazonStop`**: stop rows linked by `driverRouteId`. Stores stop number, route code, address, planned/actual time, type, quantity, and summary. (`TSRAmazonStop.jsonc`, lines 5–40.)
+- **`TSRAmazonBreak`**: break rows linked by `driverRouteId`. Stores sequence, label, after-stop number, start/end time, and duration. (`TSRAmazonBreak.jsonc`, lines 5–32.)
+
+The receiver upserts routes by `(amazonDaySyncId, itineraryId)`. On a repeat itinerary, it updates the route and deletes/replaces its stops and breaks. Stop and break items are also deduplicated within the incoming payload by `stopNumber` and `breakSequence`. Progress counts unique stored itineraries, capped at `totalDrivers`, so a retry does not inflate the driver count. (`tsrAmazonReceiveDriver/entry.ts`, lines 80–100, 145–174.)
+
+## 6. Successful, incomplete, failed, and interrupted
+
+**Successful:** the receiver changes the Day Sync from `Pending` to `Syncing` for each accepted driver, updates `totalDrivers`, `processedDrivers`, and `lastActivityAt`, and persists the route. When the extension sends its complete message, the finalizer marks it `Completed` only if reported successful drivers equal the total, stored unique itineraries equal the total, and every route has `routeComplete === true`. It writes `completedAt`. (`tsrAmazonReceiveDriver/entry.ts`, lines 164–174; `tsrAmazonFinalizeSync/entry.ts`, lines 46–67.)
+
+**Incomplete / completed with errors:** the finalizer writes `CompletedWithErrors` when the extension reports completion but any of those checks fail. It records the stored unique route count as `processedDrivers` and the extension-reported `failedDrivers` (defaulting to zero). A route with `complete: false` is included as incomplete through `routeComplete: false`, preventing overall `Completed`. (`tsrAmazonFinalizeSync/entry.ts`, lines 49–67.)
+
+**Failed:** if the extension sends `AMAZON_EXTRACTION_FAILED`, the page calls the finalizer with `outcome: "failed"`; it sets the Day Sync status to `Failed` and writes `completedAt`. If a driver POST itself errors, the receiver returns an error response and attempts a `SyncLog` error entry, but the overall Day Sync becomes `Failed` only if the extension reports the overall failure. (`useAmazonExtensionSync.js`, lines 36–50; `tsrAmazonReceiveDriver/entry.ts`, lines 194–208; `tsrAmazonFinalizeSync/entry.ts`, lines 53–67.)
+
+**Interrupted:** if no new driver data arrives for over two minutes, the scheduled workflow runs every five minutes and changes stale `Pending`/`Syncing` records to `Interrupted`, setting `completedAt` while preserving already received routes. Starting a new sync also checks and interrupts stale runs; the page’s active-sync check treats stale ones as inactive. (`TSR Amazon Stale Sync Sweeper.jsonc`, lines 2–18, 27–35; `tsrAmazonSweepStaleSyncs/entry.ts`, lines 22–35; `tsrAmazonStartSync/entry.ts`, lines 63–73, 169–179; `tsrAmazonGetActiveSync/entry.ts`, lines 43–63.)
+
+## 7. Extension completion messages
+
+Yes, Base44 listens for both named messages. It checks that the message came from the current window and same origin, accepts only the two message types, then verifies the optional flow type and matches the period/date to the run it is waiting for. It calls `tsrAmazonFinalizeSync` with the result and refreshes the page data. (`useAmazonExtensionSync.js`, lines 33–58.)
+
+Simplified from the current listener:
+
+```javascript
+if (event.source !== window || event.origin !== window.location.origin) return;
+if (type !== "AMAZON_EXTRACTION_COMPLETE" &&
+    type !== "AMAZON_EXTRACTION_FAILED") return;
+
+if (payload.flowType && payload.flowType !== DA_FLOW_TYPE) return;
+if (payload.period !== periodId || payload.date !== date) return;
+
+await base44.functions.invoke("tsrAmazonFinalizeSync", {
+  periodId,
+  date,
+  outcome: type === "AMAZON_EXTRACTION_FAILED" ? "failed" : "complete",
+  totalDrivers: payload.totalDrivers,
+  successfulDrivers: payload.successfulDrivers,
+  failedDrivers: payload.failedDrivers,
+  _authToken: getToken()
+});
+```
+
+`AMAZON_EXTRACTION_ERROR` is also listened for, but only to detect an “Extension context invalidated” condition and show the extension-error UI; it does not finalize the Day Sync. (`useAmazonExtensionSync.js`, lines 68–100.)
+
+## 8. End-to-end and files
+
+```text
+Amazon Sync/Re-sync button
+→ tsrAmazonStartSync creates Pending Day Sync + one-hour JWT
+→ START_AMAZON_EXTRACTION via window.postMessage
+→ AMP Extractor / Amazon Logistics (extension internals not in app source)
+→ one-driver POSTs with Bearer JWT
+→ tsrAmazonReceiveDriver validates and stores route + stops + breaks
+→ AMAZON_EXTRACTION_COMPLETE or AMAZON_EXTRACTION_FAILED
+→ tsrAmazonFinalizeSync sets terminal status
+   (or stale detection sets Interrupted)
+```
+
+Main app files: `src/components/tsr/amazon/TsrAmazonDayRow.jsx` (buttons), `src/components/tsr/TsrAmazonDaUploadCard.jsx` (period-day list), `src/hooks/useAmazonExtensionSync.js` (start message/listeners), `src/pages/TsrPeriodDetail.jsx` (period data loading), and `src/lib/amazonDaySyncStatus.js` (flow/status constants).
+
+Main backend functions: `tsrAmazonStartSync`, `tsrAmazonReceiveDriver`, `tsrAmazonFinalizeSync`, `tsrAmazonGetActiveSync`, `tsrAmazonLoadDaySummaries`, and `tsrAmazonSweepStaleSyncs`; the scheduled sweeper is wired by `base44/workflows/TSR Amazon Stale Sync Sweeper.jsonc`.
+
+**Not verified:** I did not run an Amazon extraction, inspect the Chrome extension’s source/runtime, or observe live POSTs/completion messages. So I can verify Base44’s current contract and handlers from source, but not that the installed extension currently sends every documented field or emits completion messages in practice.
