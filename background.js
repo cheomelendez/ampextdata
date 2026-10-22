@@ -95,6 +95,60 @@ function buildFlowContext(payload) {
   return { flow, context };
 }
 
+async function enableDaBackgroundRendering(tabId) {
+  if (!chrome.debugger) {
+    throw new Error("DA background rendering requires the debugger permission. Reload the updated extension.");
+  }
+  const target = { tabId };
+  let attached = false;
+  let interrupted = null;
+  let released = false;
+  function onDetach(source, reason) {
+    if (source.tabId !== tabId || released) return;
+    attached = false;
+    interrupted = new Error(
+      `DA background rendering was interrupted (${reason}). Keep Chrome's debugging session running until extraction finishes.`,
+    );
+    console.error("[extract-da-itineraries-data]", interrupted.message);
+  }
+  async function release() {
+    if (released) return;
+    released = true;
+    chrome.debugger.onDetach.removeListener(onDetach);
+    if (!attached) return;
+    try {
+      await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: false });
+    } catch (error) {
+      console.warn("[extract-da-itineraries-data] Could not clear focus emulation:", error.message);
+    } finally {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (error) {
+        console.warn("[extract-da-itineraries-data] Could not detach rendering session:", error.message);
+      }
+      attached = false;
+    }
+  }
+  chrome.debugger.onDetach.addListener(onDetach);
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    // Browser-level emulation keeps visibility-dependent rendering running.
+    // It does not activate the tab or focus its window. Chrome shows a debugging
+    // banner while attached; this is not a completely invisible execution mode.
+    await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
+    if (interrupted) throw interrupted;
+    console.log("[extract-da-itineraries-data] Background rendering enabled; your app tab stays active");
+    return {
+      release,
+      assertConnected() { if (interrupted) throw interrupted; },
+    };
+  } catch (error) {
+    await release();
+    throw new Error(`Could not enable DA background rendering: ${error.message}`);
+  }
+}
+
 async function executeFlowForDate(flow, context, date, onResult) {
   const url = flow.buildUrl({
     baseUrl: context.baseUrl,
@@ -105,14 +159,29 @@ async function executeFlowForDate(flow, context, date, onResult) {
   console.log(`[${context.flowType}] Processing date: ${date}`);
   console.log(`[${context.flowType}] Requested URL: ${url}`);
 
+  const isDaFlow = flow.type === "extract-da-itineraries-data";
   const tab = await chrome.tabs.create({
-    url,
-    active: flow.type === "extract-da-itineraries-data"
+    // Configure rendering before Amazon's first scripts execute in a hidden tab.
+    url: isDaFlow ? "about:blank" : url,
+    active: isDaFlow
       ? false
       : Boolean(context.debugActiveTab),
   });
   const runId = flow.submitPerDriver ? crypto.randomUUID() : null;
   let daKeepAliveId;
+  let daRendering;
+  let finalResultPromise;
+  let resolvePageFinished;
+  const pageFinished = new Promise((resolve) => { resolvePageFinished = resolve; });
+  // The page's explicit completion message and executeScript's return can both
+  // report this date. Run the notification callback only once.
+  function reportResultOnce(result) {
+    if (!finalResultPromise) {
+      finalResultPromise = Promise.resolve().then(() => onResult?.(result));
+      resolvePageFinished([{ result }]);
+    }
+    return finalResultPromise;
+  }
 
   console.log(
     `[${context.flowType}] Created tab ${tab.id} with initial URL:`,
@@ -120,6 +189,10 @@ async function executeFlowForDate(flow, context, date, onResult) {
   );
 
   try {
+    if (isDaFlow) {
+      daRendering = await enableDaBackgroundRendering(tab.id);
+      await chrome.tabs.update(tab.id, { url });
+    }
     await waitForTabComplete(tab.id);
     console.log(`[${context.flowType}] Tab loaded`);
 
@@ -146,6 +219,7 @@ async function executeFlowForDate(flow, context, date, onResult) {
         tabId: tab.id,
         nextSubmissionAt: 0,
         inFlight: false,
+        reportResult: reportResultOnce,
       });
     }
     if (flow.type === "extract-da-itineraries-data") {
@@ -157,7 +231,8 @@ async function executeFlowForDate(flow, context, date, onResult) {
         });
       }, 25000);
     }
-    const [result] = await chrome.scripting.executeScript({
+    daRendering?.assertConnected();
+    const execution = chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: flow.extractInPage,
       args: [
@@ -175,6 +250,9 @@ async function executeFlowForDate(flow, context, date, onResult) {
       ],
     });
 
+    // An explicit end-of-date handoff is sufficient even if Chrome's original
+    // long-running executeScript response is delayed or never arrives.
+    const [result] = await (isDaFlow ? Promise.race([execution, pageFinished]) : execution);
     const extractedData = result?.result;
     console.log(`[${context.flowType}] executeScript result wrapper:`, result);
     console.log(`[${context.flowType}] Extracted data:`, extractedData);
@@ -183,10 +261,11 @@ async function executeFlowForDate(flow, context, date, onResult) {
       await submitFlowResult(flow, context, { date, extractedData, url });
     }
     // Report the extraction outcome before optional debug waits and tab cleanup.
-    if (onResult) await onResult(extractedData);
+    if (onResult) await reportResultOnce(extractedData);
   } finally {
     if (daKeepAliveId !== undefined) clearInterval(daKeepAliveId);
     if (runId) activeDriverRuns.delete(runId);
+    if (daRendering) await daRendering.release();
     const keepTabOpenMs = Number(context.keepTabOpenMs || 0);
 
     if (keepTabOpenMs > 0) {
@@ -253,8 +332,15 @@ async function submitBatches(flow, context, submissions) {
         break;
       }
 
-      if (response.status !== 429 || attempt >= maxRetries) {
-        const details = daSubmissionErrors.get(response);
+      const details = daSubmissionErrors.get(response);
+      // The DA receiver sometimes wraps an upstream rate limit in HTTP 500.
+      // Retry that explicit error using the same policy as HTTP 429; unrelated
+      // server errors and other flows retain their existing behavior.
+      const isDaServerRateLimit =
+        context.flowType === "extract-da-itineraries-data" &&
+        response.status === 500 &&
+        /\brate[\s-]+limit\s+exceeded\b/i.test(details || "");
+      if ((response.status !== 429 && !isDaServerRateLimit) || attempt >= maxRetries) {
         const error = new Error(
           `Batch ${index + 1}/${submissions.length} submission failed: HTTP ${response.status}` +
             (details ? `; API response: ${details}` : ""),
@@ -389,19 +475,47 @@ function buildDaCompletionMessage(context, date, result) {
 }
 
 async function notifyDaOrigin(origin, message) {
-  if (origin?.tabId == null) return; // Toolbar runs have no originating webpage.
-  try {
-    await chrome.tabs.sendMessage(origin.tabId, message, {
-      frameId: origin.frameId,
-      ...(origin.documentId ? { documentId: origin.documentId } : {}),
-    });
-  } catch (error) {
-    // A closed/reloaded app page must not change extraction or submission behavior.
-    console.warn(
-      "Could not deliver DA extraction notification to the originating page:",
-      error,
-    );
+  if (origin?.tabId == null) return true; // Toolbar runs have no originating webpage.
+  const envelope = {
+    ...message,
+    notificationId: crypto.randomUUID(),
+    ...(origin.pageOrigin ? { targetOrigin: origin.pageOrigin } : {}),
+  };
+  let documentId = origin.documentId;
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    let timeout;
+    try {
+      const ack = await Promise.race([
+        chrome.tabs.sendMessage(origin.tabId, envelope, {
+          frameId: origin.frameId,
+          ...(documentId ? { documentId } : {}),
+        }),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Completion relay acknowledgment timed out")), 5000);
+        }),
+      ]);
+      if (ack?.received !== true) throw new Error(ack?.error || "Content script did not acknowledge the final result");
+      console.log(`[extract-da-itineraries-data] ${message.type} for ${message.payload.date} relayed to app tab ${origin.tabId}`);
+      return true;
+    } catch (error) {
+      lastError = error;
+      console.warn(`[extract-da-itineraries-data] Final-result delivery attempt ${attempt}/3 failed:`, error.message);
+      // A same-origin reload replaces the document ID. Only the original top
+      // frame may fall back, and content.js checks the origin again at receipt.
+      if (documentId && origin.frameId === 0 && origin.pageOrigin) {
+        try {
+          const tab = await chrome.tabs.get(origin.tabId);
+          if (new URL(tab.url).origin === origin.pageOrigin) documentId = undefined;
+        } catch { /* Closed/navigated tabs cannot receive this result. */ }
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (attempt < 3) await sleep(attempt * 1000);
   }
+  console.error("[extract-da-itineraries-data] Extraction finished, but its final result could not be relayed to the app:", message, lastError);
+  return false;
 }
 
 async function runExtraction(payload, origin) {
@@ -447,6 +561,19 @@ async function runExtraction(payload, origin) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "DA_EXTRACTION_FINISHED") {
+    const run = activeDriverRuns.get(message.runId);
+    if (!run || run.flow.type !== "extract-da-itineraries-data" ||
+        sender.tab?.id !== run.tabId || run.inFlight) {
+      sendResponse({ received: false, error: "Final result does not belong to an idle active DA extraction" });
+      return;
+    }
+    run.reportResult(message.result).then(
+      () => sendResponse({ received: true }),
+      (error) => sendResponse({ received: false, error: error.message }),
+    );
+    return true;
+  }
   if (message.type === "SUBMIT_DA_ROUTE") {
     submitDriverRoute(message, sender).then(sendResponse, (error) =>
       sendResponse({
@@ -466,6 +593,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           tabId: sender.tab.id,
           frameId: sender.frameId ?? 0,
           documentId: sender.documentId,
+          pageOrigin: sender.origin || (sender.url ? new URL(sender.url).origin : undefined),
         }
       : undefined;
     runExtraction(message.payload, origin);

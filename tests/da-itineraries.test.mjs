@@ -53,7 +53,7 @@ async function harness(rows, respond = () => ({ success: true, status: 200 }), o
   // Expose the injected function's helpers without changing its production API.
   const injected = flow.extractInPage.toString().replace(
     '  console.log("[da-itineraries-page] Waiting for the DAs button...");',
-    `  return { readDriverRows, countDriverRoster, collectDrivers, generateEmptyItineraryId,
+    `  return { readDriverRows, readRouteHeader, countDriverRoster, collectDrivers, generateEmptyItineraryId,
       waitForReturningDriverList, returnToDriverList,
       useReturnControls(panel, button) {
         findRoutePanel = panel;
@@ -323,4 +323,64 @@ test("exhausted recovery stops within its budget and labels remaining drivers un
   assert.ok(run.logs.some(({ args }) => String(args[0]).includes(
     "1 successfully sent, 0 submission failures, 0 extraction failures, 2 not processed",
   )));
+});
+
+function routePanelWithBreaks(labels) {
+  const progress = ["DA progress", "10/10 stops", "20/20 deliveries"]
+    .map((textContent) => ({ textContent }));
+  progress[0].parentElement = { querySelectorAll: () => progress };
+  const breaksTitle = {
+    textContent: "Breaks taken",
+    parentElement: { parentElement: { textContent: `Breaks taken ${labels.length} (${labels.length * 10}m total)` } },
+  };
+  const details = labels.map((textContent, index) => ({
+    textContent,
+    parentElement: {
+      textContent: `${textContent} (after stop #${index + 2}) ${index + 1}:18pm - ${index + 1}:28pm (10m)`,
+    },
+  }));
+  const paragraphs = [...progress, breaksTitle, ...details,
+    // Summary/help/event text must not become an additional break detail.
+    { textContent: "Includes 30m of paid rest breaks and 30m of unpaid meal breaks" },
+    { textContent: "Heat break taken at 1:18pm (10min)" },
+  ];
+  return {
+    querySelectorAll: (selector) => selector === "p" ? paragraphs : [],
+    querySelector: () => ({ textContent: "Driver" }),
+  };
+}
+
+for (const label of ["Break", "Heat break", "Rest break", "Meal break", "Heat break 1"]) {
+  test(`single break detail is included for label "${label}"`, async () => {
+    const { helpers } = await harness([]);
+    const header = plain(helpers.readRouteHeader(routePanelWithBreaks([label]), {
+      driver: { transporterId: "D", itineraryId: "I" },
+    }));
+    assert.deepEqual(header.breaksTaken, {
+      count: 1,
+      totalDuration: "10m",
+      items: [{ label, afterStop: 2, startTime: "1:18pm", endTime: "1:28pm", duration: "10m" }],
+    });
+  });
+}
+
+test("multiple numbered breaks retain their individual times and stop numbers", async () => {
+  const { helpers } = await harness([]);
+  const header = plain(helpers.readRouteHeader(routePanelWithBreaks(["Heat break 1", "Heat break 2"]), {
+    driver: { transporterId: "D", itineraryId: "I" },
+  }));
+  assert.deepEqual(header.breaksTaken, {
+    count: 2,
+    totalDuration: "20m",
+    items: [
+      { label: "Heat break 1", afterStop: 2, startTime: "1:18pm", endTime: "1:28pm", duration: "10m" },
+      { label: "Heat break 2", afterStop: 3, startTime: "2:18pm", endTime: "2:28pm", duration: "10m" },
+    ],
+  });
+});
+
+test("zero breaks does not create a placeholder detail", async () => {
+  const { helpers } = await harness([]);
+  const header = plain(helpers.readRouteHeader(routePanelWithBreaks([]), { driver: {} }));
+  assert.deepEqual(header.breaksTaken, { count: 0, totalDuration: "0m", items: [] });
 });

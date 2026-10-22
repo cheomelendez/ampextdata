@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AMP Extractor",
   "version": "1.0",
-  "permissions": ["tabs", "scripting"],
+  "permissions": ["tabs", "scripting", "debugger"],
   "host_permissions": [
     "https://logistics.amazon.com/*",
     "https://recon.amngtpro.com/*",

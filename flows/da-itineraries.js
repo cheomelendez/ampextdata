@@ -407,7 +407,9 @@ async function extractDaItinerariesInPage(context) {
     const breakCount = summary.match(/^(\d+)\b/);
     const duration = summary.match(/\((.*?)\s+total\)/i);
     const breaks = paragraphs
-      .filter((node) => /\bbreak\s+\d+$/i.test(normalizeText(node.textContent)))
+      // A single break may have an unnumbered label ("Break", "Heat break").
+      // Keep the number optional so the details agree with the separate count.
+      .filter((node) => /\bbreak(?:\s+\d+)?$/i.test(normalizeText(node.textContent)))
       .map((node) => {
         const text = normalizeText(node.parentElement.textContent);
         const afterStop = text.match(/after stop\s*#(\d+)/i);
@@ -976,10 +978,15 @@ async function extractDaItinerariesInPage(context) {
       }
     }
 
-    const list = findDriverList();
-    const scroller = list && findScrollContainer(list);
-    if (scroller)
-      scroller.scrollTo({ top: roster.originalScrollTop, behavior: "instant" });
+    // Cosmetic cleanup must not prevent reporting already-finished submissions.
+    try {
+      const list = findDriverList();
+      const scroller = list && findScrollContainer(list);
+      if (scroller)
+        scroller.scrollTo({ top: roster.originalScrollTop, behavior: "instant" });
+    } catch (error) {
+      console.warn("[da-itineraries-page] Could not restore list position after extraction:", error.message);
+    }
     const successful = submissionResults.filter((item) => item.success).length;
     const submissionSummary = {
       successful,
@@ -1041,6 +1048,23 @@ async function extractDaItinerariesInPage(context) {
   result.status = result.complete
     ? "DA routes extracted and submitted"
     : "DA extraction/submission finished with incomplete results";
+  // Hand off the finished date without relying solely on the long-running
+  // executeScript response channel. Its return remains a fallback.
+  try {
+    const ack = await chrome.runtime.sendMessage({
+      type: "DA_EXTRACTION_FINISHED",
+      runId: context.runId,
+      result: {
+        totalDrivers: result.totalDrivers,
+        submissionSummary: result.submissionSummary,
+        submissionResults: result.submissionResults,
+      },
+    });
+    if (!ack?.received) throw new Error(ack?.error || "Final result was not acknowledged");
+    console.log("[da-itineraries-page] Final result handed to background worker");
+  } catch (error) {
+    console.warn("[da-itineraries-page] Final-result handoff failed; using script return:", error.message);
+  }
   return result;
 }
 function buildSubmission({ context, date, extractedData }) {
