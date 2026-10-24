@@ -1,11 +1,8 @@
-console.log("WORK-SUMMARY>JS started");
-
 const FLOW_TYPE = "extract-work-summary-tool-data";
 const DEFAULT_BASE_URL =
   "https://logistics.amazon.com/harmony/v2/#!/dsp-portal?serviceAreaId={serviceAreaId}&localDate={date}";
 const SUBMIT_URL =
   "https://recon.amngtpro.com/api/functions/receiveWorkSummaryData";
-//const SUBMIT_URL = "https://candidate-dashboard-integration.free.beeceptor.com";
 
 function buildUrl({ baseUrl, date, serviceAreaId }) {
   return baseUrl
@@ -14,19 +11,6 @@ function buildUrl({ baseUrl, date, serviceAreaId }) {
 }
 
 async function extractWorkSummaryToolInPage(context) {
-  console.log("[work-summary-page] Context:", context);
-  console.log(
-    "[work-summary-page] window.location.href:",
-    window.location.href,
-  );
-  console.log(
-    "[work-summary-page] window.location.search:",
-    window.location.search,
-  );
-  console.log(
-    "[work-summary-page] window.location.hash:",
-    window.location.hash,
-  );
 
   function waitForPageStability() {
     return new Promise((resolve) => {
@@ -162,7 +146,6 @@ async function extractWorkSummaryToolInPage(context) {
       holder.querySelector(".fwt-listBoxHeading");
 
     if (!expandTarget) {
-      console.warn("[work-summary-page] Training expand target not found");
       return;
     }
 
@@ -192,7 +175,6 @@ async function extractWorkSummaryToolInPage(context) {
     });
 
     if (countsByHours.size === 0) {
-      console.warn("[work-summary-page] Training rows found without durations");
       return [buildEmptyRoute("Training")];
     }
 
@@ -283,7 +265,6 @@ async function extractWorkSummaryToolInPage(context) {
   function extractHeader() {
     const headerRoot = document.querySelector("#fwt-dspReviewHeader");
     if (!headerRoot) {
-      console.warn("[work-summary-page] Header root not found");
       return {
         totalPackages: 0,
         deliveredPackages: 0,
@@ -303,7 +284,6 @@ async function extractWorkSummaryToolInPage(context) {
       miles: valuesByLabel["miles"] ?? 0,
     };
 
-    console.log("[work-summary-page] Extracted header:", header);
     return header;
   }
 
@@ -313,7 +293,6 @@ async function extractWorkSummaryToolInPage(context) {
     );
 
     if (!routeListContainer) {
-      console.warn("[work-summary-page] Route list container not found");
       return [];
     }
 
@@ -357,14 +336,10 @@ async function extractWorkSummaryToolInPage(context) {
       });
     }
 
-    console.log("[work-summary-page] Extracted routes:", routes);
     return routes;
   }
 
   await waitForPageStability();
-  console.log(
-    "[work-summary-page] Page stabilized, extracting header and routes",
-  );
 
   return {
     header: extractHeader(),
@@ -393,8 +368,6 @@ export const workSummaryToolFlow = {
   defaultBaseUrl: DEFAULT_BASE_URL,
   postLoadDelayMs: 6000,
   betweenDatesDelayMs: 3000,
-  matchesExpectedUrl: ({ currentUrl, date }) =>
-    currentUrl.includes(`localDate=${date}`),
   buildUrl,
   extractInPage: extractWorkSummaryToolInPage,
   buildSubmission,

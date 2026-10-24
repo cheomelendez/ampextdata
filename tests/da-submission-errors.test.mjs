@@ -12,10 +12,13 @@ function harness(responses, flowType = daType, retries = 0, delayMs = 0) {
   let listener;
   const sandbox = {
     Response,
+    AbortSignal,
     console: { log() {}, warn() {}, error() {} },
     setTimeout: (callback, ms) => { waits.push(ms); callback(); },
     fetch: async (url, options) => {
-      requests.push({ url, ...options });
+      assert.ok(options.signal instanceof AbortSignal);
+      const { signal, ...request } = options;
+      requests.push({ url, ...request });
       assert.ok(responses.length, "Unexpected additional API request");
       return responses.shift();
     },

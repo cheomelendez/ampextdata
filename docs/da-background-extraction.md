@@ -1,5 +1,9 @@
 # DA extraction while the app tab stays active
 
+The user must already be signed in to Amazon Logistics. The extension does not
+provide login. Start extraction from the top-level page at
+`https://recon.amngtpro.com`; the toolbar icon does not start extraction.
+
 The DA flow opens an inactive blank tab, attaches Chrome's debugger transport,
 enables `Emulation.setFocusEmulationEnabled`, and then navigates to Amazon.
 This allows visibility-dependent rendering to run without activating the Amazon
@@ -43,3 +47,43 @@ References:
 
 - https://developer.chrome.com/docs/devtools/rendering/apply-effects#emulate_a_focused_page
 - https://developer.chrome.com/docs/extensions/reference/api/debugger
+
+## Production security checks
+
+The app bridge accepts only same-window, same-origin requests. The worker
+independently authorizes the app origin and validates the requested flow, dates,
+service area, token format, and Amazon URL before creating a tab. Loaded URLs
+are checked again before extraction. Known DA routes/itineraries redirects are
+allowed; a redirect may omit the service area, but a different explicit area is
+rejected. Persistent login/wrong-page redirects fail with a sign-in/retry message.
+
+The token stays in the worker and is included in the API's Bearer header. It is
+not passed to the injected extractor, logged, or stored persistently. Backend
+token signature, expiry, scope, and tenant checks remain necessary. There is no
+token-refresh endpoint or protocol in this extension.
+
+The supported maximum is 150 drivers per date. Larger rosters fail before any
+driver is submitted. This avoids silently reporting a capped roster as complete.
+The five-second inter-driver spacing is unchanged: 150 drivers need at least
+745 seconds of spacing alone. A fixed 10-minute token can therefore expire
+before the run finishes. Coordinate a run-scoped renewal protocol with the app
+and backend, or choose an explicitly bounded run credential lifetime sufficient
+for measured extraction time. Do not reduce the spacing to work around expiry.
+
+Duplicate starts for active flow/area/period/date keys are ignored without
+emitting a failure for the existing sync. Other concurrent runs are refused.
+Tab loading has a 90-second timeout and detects tab closure; HTTP requests,
+including reading their response bodies, have a 60-second abort deadline.
+Network timeouts are not automatically retried, since a timed-out write may
+already have been accepted. Existing DA rate-limit retries are unchanged.
+
+Production logs retain counts, HTTP status, and generic lifecycle warnings.
+They omit tokens, full URLs, employee identifiers, route/stop records, raw API
+responses, and DOM snapshots. Bounded API failure details remain in the existing
+per-driver error result for compatibility; backend errors should not contain
+credentials or unnecessary personal data.
+
+Run `node --test tests/*.test.mjs` for local regression tests. After applying
+these changes, reload both the extension and the AMP app tab and perform a
+controlled authenticated sync. Unit tests use mocked DOM, Chrome, and network
+APIs and do not prove compatibility with a changed Amazon page or backend.

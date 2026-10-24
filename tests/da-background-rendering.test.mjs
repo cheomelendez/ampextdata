@@ -7,6 +7,12 @@ import vm from "node:vm";
 const source = await readFile(new URL("../background.js", import.meta.url), "utf8");
 const daType = "extract-da-itineraries-data";
 const url = "https://logistics.amazon.com/operations/execution/itineraries?selectedDay=2026-10-01";
+const flowUrls = {
+  [daType]: url,
+  "extract-route-assignments-data": "https://logistics.amazon.com/scheduling?date=2026-10-01&serviceAreaId=area",
+  "extract-weekly-schedule": "https://logistics.amazon.com/scheduling/calendar-view/week?date=2026-10-01&serviceAreaId=area",
+  "extract-work-summary-tool-data": "https://logistics.amazon.com/harmony/v2/#!/dsp-portal?localDate=2026-10-01&serviceAreaId=area",
+};
 
 function harness({ attachFails = false, commandFails = false, extractFails = false, disableFails = false,
   handoff = false, neverReturns = false, detachAtEnd = false } = {}) {
@@ -39,9 +45,11 @@ function harness({ attachFails = false, commandFails = false, extractFails = fal
       async get(id) { return { id, status: "complete", url: tabUrl }; },
       async remove(id) { calls.push(["remove", id]); },
       onUpdated: { addListener() {}, removeListener() {} },
+      onRemoved: { addListener() {}, removeListener() {} },
     },
     scripting: {
       async executeScript(options) {
+        assert.equal("token" in options.args[0], false, "The API credential stays in the worker");
         calls.push(["extract", options.target]);
         if (extractFails) throw new Error("Extraction failed");
         if (handoff) {
@@ -63,9 +71,10 @@ function harness({ attachFails = false, commandFails = false, extractFails = fal
     source.replace('import { FLOW_REGISTRY } from "./flows/index.js";', "const FLOW_REGISTRY = {};") +
       "\n;({ enableDaBackgroundRendering, executeFlowForDate, activeDriverRuns });",
     {
-      chrome, crypto: webcrypto,
+      chrome, crypto: webcrypto, URL, URLSearchParams,
       console: { log() {}, warn() {}, error() {} },
-      setTimeout: (callback) => callback(),
+      setTimeout: (callback, ms) => ms === 90000 ? setTimeout(callback, ms) : callback(),
+      clearTimeout,
       setInterval: () => 1,
       clearInterval: () => calls.push(["clearInterval"]),
     },
@@ -74,8 +83,8 @@ function harness({ attachFails = false, commandFails = false, extractFails = fal
     ...api, calls, listeners,
     run(type = daType, closeTab = false) {
       return api.executeFlowForDate(
-        { type, buildUrl: () => url, submitPerDriver: type === daType, extractInPage() {} },
-        { flowType: type, debugActiveTab: true, closeTab, serviceAreaId: "area" },
+        { type, buildUrl: () => flowUrls[type], submitPerDriver: type === daType, extractInPage() {} },
+        { flowType: type, debugActiveTab: true, closeTab, serviceAreaId: "area", token: "must-stay-in-worker" },
         "2026-10-01",
         async () => calls.push(["result"]),
       );
@@ -174,7 +183,7 @@ for (const type of ["extract-route-assignments-data", "extract-weekly-schedule",
   test(`${type} keeps its existing tab behavior without attaching a debugger`, async () => {
     const h = harness();
     await h.run(type);
-    assert.equal(h.calls[0][1].url, url);
+    assert.equal(h.calls[0][1].url, flowUrls[type]);
     assert.equal(h.calls[0][1].active, true);
     assert.ok(!h.calls.some(([name]) => ["attach", "command", "detach", "update"].includes(name)));
   });

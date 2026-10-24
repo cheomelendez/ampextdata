@@ -1,5 +1,4 @@
-console.log("✅ content.js injected");
-console.log("chrome.runtime:", chrome.runtime);
+const TRUSTED_APP_ORIGIN = "https://recon.amngtpro.com";
 const deliveredDaNotifications = new Set();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -32,6 +31,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 window.addEventListener("message", (event) => {
+  if (window.location.origin !== TRUSTED_APP_ORIGIN ||
+      event.origin !== TRUSTED_APP_ORIGIN || event.source !== window) return;
   if (event.data?.type === "START_AMAZON_EXTRACTION") {
     try {
       chrome.runtime.sendMessage(
@@ -43,15 +44,13 @@ window.addEventListener("message", (event) => {
           if (chrome.runtime.lastError) {
             console.error(
               "Failed to relay START_AMAZON_EXTRACTION to extension:",
-              chrome.runtime.lastError.message,
             );
           }
         },
       );
-    } catch (error) {
+    } catch {
       console.error(
         "Extension context invalidated while relaying START_AMAZON_EXTRACTION. Reload the page after reloading the extension.",
-        error,
       );
     }
   }

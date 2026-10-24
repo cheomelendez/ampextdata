@@ -1,10 +1,7 @@
-console.log("ROUTE-ASSIGNMENT>JS started");
-
 const FLOW_TYPE = "extract-route-assignments-data";
 const DEFAULT_BASE_URL =
   "https://logistics.amazon.com/scheduling?serviceAreaId={serviceAreaId}&date={date}";
 const SUBMIT_URL = "https://recon.amngtpro.com/api/functions/receiveRouteData";
-//const SUBMIT_URL = "https://candidate-dashboard-integration.free.beeceptor.com";
 
 function buildUrl({ baseUrl, date, serviceAreaId }) {
   return baseUrl
@@ -13,19 +10,6 @@ function buildUrl({ baseUrl, date, serviceAreaId }) {
 }
 
 async function extractRouteAssignmentsInPage(context) {
-  console.log("[route-assignments-page] Context:", context);
-  console.log(
-    "[route-assignments-page] window.location.href:",
-    window.location.href,
-  );
-  console.log(
-    "[route-assignments-page] window.location.search:",
-    window.location.search,
-  );
-  console.log(
-    "[route-assignments-page] window.location.hash:",
-    window.location.hash,
-  );
 
   function parseRow(row) {
     const rowContainer = row.closest(".row");
@@ -129,7 +113,6 @@ async function extractRouteAssignmentsInPage(context) {
   function extract() {
     const container = document.querySelector("#confirmedServiceRequestSection");
     if (!container) {
-      console.warn("Route assignments container not found");
       return [];
     }
 
@@ -161,7 +144,6 @@ async function extractRouteAssignmentsInPage(context) {
   }
 
   await waitForUI();
-  console.log("[route-assignments-page] UI ready, starting extraction");
   return extract();
 }
 
@@ -185,7 +167,6 @@ export const routeAssignmentsFlow = {
   defaultBaseUrl: DEFAULT_BASE_URL,
   postLoadDelayMs: 4000,
   betweenDatesDelayMs: 5000,
-  matchesExpectedUrl: ({ currentUrl, date }) => currentUrl.includes(`date=${date}`),
   buildUrl,
   extractInPage: extractRouteAssignmentsInPage,
   buildSubmission,

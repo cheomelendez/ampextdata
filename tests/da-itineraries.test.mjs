@@ -265,6 +265,26 @@ function assignedRows(count) {
   ));
 }
 
+test("150-driver roster is processed without truncation or sensitive driver logs", async () => {
+  const h = await harness(assignedRows(150));
+  h.helpers.useNavigation(
+    async () => ({ scrollTop: 0, link: { scrollIntoView() {}, click() {} } }),
+    async (entry) => ({ ...entry.driver, stops: [], complete: true }),
+    async () => {},
+  );
+  const result = await h.helpers.collectDrivers();
+  assert.equal(result.totalDrivers, 150);
+  assert.equal(result.submissionSummary.successful, 150);
+  assert.equal(h.requests.length, 150);
+  assert.doesNotMatch(JSON.stringify(h.logs), /Driver 1|transporterId|itineraryId/);
+});
+
+test("151-driver roster fails before submitting anything instead of reporting a truncated success", async () => {
+  const h = await harness(assignedRows(151));
+  await assert.rejects(h.helpers.collectDrivers(), /Found 151 drivers; the supported maximum is 150/);
+  assert.equal(h.requests.length, 0);
+});
+
 test("48-driver run recovers after driver 27 without repeating any submissions", async () => {
   const roster = assignedRows(48);
   const rows = [...roster];

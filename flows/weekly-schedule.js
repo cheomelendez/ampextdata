@@ -1,11 +1,8 @@
-console.log("WEEKLY-SCHEDULE>JS started");
-
 const FLOW_TYPE = "extract-weekly-schedule";
 const DEFAULT_BASE_URL =
   "https://logistics.amazon.com/scheduling/calendar-view/week?date={date}&serviceAreaId={serviceAreaId}";
 const SUBMIT_URL =
   "https://recon.amngtpro.com/api/functions/receiveWeeklyScheduleData";
-//const SUBMIT_URL = "https://candidate-dashboard-integration.free.beeceptor.com";
 
 function buildUrl({ baseUrl, date, serviceAreaId }) {
   return baseUrl
@@ -14,19 +11,6 @@ function buildUrl({ baseUrl, date, serviceAreaId }) {
 }
 
 async function extractWeeklyScheduleInPage(context) {
-  console.log("[weekly-schedule-page] Context:", context);
-  console.log(
-    "[weekly-schedule-page] window.location.href:",
-    window.location.href,
-  );
-  console.log(
-    "[weekly-schedule-page] window.location.search:",
-    window.location.search,
-  );
-  console.log(
-    "[weekly-schedule-page] window.location.hash:",
-    window.location.hash,
-  );
 
   function waitForPageStability() {
     return new Promise((resolve) => {
@@ -456,12 +440,6 @@ async function extractWeeklyScheduleInPage(context) {
         return popup;
       }
 
-      console.warn(
-        "[weekly-schedule-page] Shift click target did not open popup:",
-        `targetIndex=${targetIndex}`,
-        entry.timeRange,
-        getElementText(clickTarget),
-      );
       await sleep(150);
     }
 
@@ -617,25 +595,17 @@ async function extractWeeklyScheduleInPage(context) {
   }
 
   await waitForPageStability();
-  console.log("[weekly-schedule-page] Page stabilized, starting extraction");
 
   const dateHeaders = extractDateHeaders();
 
   const sectionRoot = findVoluntarySectionRoot();
   if (!sectionRoot) {
-    console.warn(
-      "[weekly-schedule-page] Could not find 'Voluntary extra time & time off' section",
-    );
     return {
       services: [],
     };
   }
 
   const employeeRows = findEmployeeRowRoots(sectionRoot);
-  console.log(
-    "[weekly-schedule-page] Employee rows detected in section:",
-    employeeRows.length,
-  );
 
   const collectedEntries = [];
   let openPopup = findOpenPopupContainer();
@@ -651,13 +621,6 @@ async function extractWeeklyScheduleInPage(context) {
     const emptyCell = findEmptyScheduleCell(rowRoot, sectionRoot);
     centerRow(rowRoot);
     await sleep(100);
-
-    console.log(
-      "[weekly-schedule-page] Processing employee:",
-      employeeName,
-      employeeIdentity,
-      `dayCells=${dayCells.length}`,
-    );
 
     for (const [dayIndex, dayCell] of dayCells.entries()) {
       const entry = getClickableEntryFromDayCell(dayCell);
@@ -675,46 +638,19 @@ async function extractWeeklyScheduleInPage(context) {
       if (!popup) {
         const unmatchedPopup = findOpenPopupContainer();
         if (unmatchedPopup) {
-          console.warn(
-            "[weekly-schedule-page] Unexpected popup remained after click retries:",
-            employeeName,
-            `dayIndex=${dayIndex}`,
-            entry.timeRange,
-            getElementText(unmatchedPopup),
-          );
           await closePopup(unmatchedPopup, emptyCell);
         }
       }
 
-      if (!popup) {
-        console.warn(
-          "[weekly-schedule-page] Popup not detected for entry:",
-          employeeName,
-          `dayIndex=${dayIndex}`,
-          entry.timeRange,
-        );
-      }
+      if (!popup) console.warn("[weekly-schedule-page] Shift details did not open");
 
       if (popup) {
         openPopup = popup;
-        if (!popupMatchesEntry(popup, entry)) {
-          console.warn(
-            "[weekly-schedule-page] Popup opened but time range was not found in popup text:",
-            employeeName,
-            `dayIndex=${dayIndex}`,
-            entry.timeRange,
-            getElementText(popup),
-          );
-        }
+        if (!popupMatchesEntry(popup, entry)) console.warn("[weekly-schedule-page] Shift details did not match the selected time range");
       }
 
       const hoursWorked = popup ? extractHoursWorked(popup) : "";
-      if (popup && !hoursWorked) {
-        console.warn(
-          "[weekly-schedule-page] Hours Worked not found in popup:",
-          getElementText(popup),
-        );
-      }
+      if (popup && !hoursWorked) console.warn("[weekly-schedule-page] Hours worked were unavailable");
 
       const columnIndex = getColumnIndexFromCell(dayCell);
       const record = {
@@ -727,13 +663,6 @@ async function extractWeeklyScheduleInPage(context) {
 
       collectedEntries.push(record);
 
-      if (collectedEntries.length % 25 === 0) {
-        console.log(
-          "[weekly-schedule-page] Collected weekly schedule entries:",
-          collectedEntries.length,
-        );
-      }
-
       if (openPopup) {
         await closePopup(openPopup, emptyCell);
         openPopup = null;
@@ -744,11 +673,6 @@ async function extractWeeklyScheduleInPage(context) {
   if (openPopup) {
     await closePopup(openPopup, findEmptyScheduleCell(sectionRoot));
   }
-
-  console.log(
-    "[weekly-schedule-page] Final collected weekly schedule entry count:",
-    collectedEntries.length,
-  );
 
   // Group entries by employee
   const employees = employeeRows.map((rowRoot) => {
@@ -776,26 +700,10 @@ async function extractWeeklyScheduleInPage(context) {
     employees,
   };
 
-  console.log(
-    "[weekly-schedule-page] Final response summary:",
-    {
-      number_of_employees: responseData.number_of_employees,
-      number_of_shifts: collectedEntries.length,
-    },
-  );
-
   return responseData;
 }
 
 function buildSubmission({ context, date, extractedData }) {
-  console.log(
-    "[weekly-schedule-submission] Building submission:",
-    {
-      date,
-      serviceAreaId: context.serviceAreaId,
-      employees: extractedData?.number_of_employees || 0,
-    },
-  );
 
   const submission = {
     url: SUBMIT_URL,
@@ -810,15 +718,6 @@ function buildSubmission({ context, date, extractedData }) {
     },
   };
 
-  console.log(
-    "[weekly-schedule-submission] Final submission summary:",
-    {
-      date: submission.body.date,
-      serviceAreaId: submission.body.serviceAreaId,
-      number_of_employees: submission.body.number_of_employees,
-    },
-  );
-
   return submission;
 }
 
@@ -827,8 +726,6 @@ export const weeklyScheduleFlow = {
   defaultBaseUrl: DEFAULT_BASE_URL,
   postLoadDelayMs: 6000,
   betweenDatesDelayMs: 3000,
-  matchesExpectedUrl: ({ currentUrl, date }) =>
-    currentUrl.includes(`date=${date}`),
   buildUrl,
   extractInPage: extractWeeklyScheduleInPage,
   buildSubmission,
